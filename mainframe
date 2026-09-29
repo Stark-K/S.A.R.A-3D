@@ -1,0 +1,3627 @@
+"""
+S.A.R.A 3D Studio (sara_v11.py) - Spatial AR Workspace
+
+Your camera feed becomes a real 3D workspace: shapes live in 3D world space with
+depth testing (Z-buffer), so they can sit behind, on top of, or inside each other.
+Control everything with your hands and your voice.
+
+WHAT'S NEW IN v11
+    * SCAN: hold an object in your hand, turn it, and it becomes a 3D model you can design.
+    * SELF-ALIGN: merging orients, centres and squares up shapes for you (pyramid on cube etc).
+    * ONLINE: "show me options on aeroplane engine" shows 3D models and info from the internet.
+    * ENGINE: "start the engine", "thrust to 80 percent": blades spin, exhaust particles stream.
+    * v10 features kept: neural female voice, 3D world with depth testing, part animation.
+
+GESTURES
+    Pinch a shape ................ grab, move and place it
+    Pinch and push/pull your hand  moves it nearer / farther (depth)
+    Pinch with BOTH hands ........ resize
+    Pinch empty space ............ rotate the selected shape
+    Release a shape touching another: snaps flush and AUTO-MERGES (tolerant)
+
+VOICE  (say "Sara", then the command; or say "Sara" and wait for "Yes?")
+    "Sara, add a red cube"                 cube pyramid cone cylinder sphere torus
+    "Sara, put it on top of the cube"      also: inside / behind / in front of / under
+    "Sara, add a sphere inside the cube"
+    "Sara, move it back"                   forward / back / left / right / up / down
+    "Sara, make it solid"                  solid / hologram / wireframe
+    "Sara, make it blue" / "bigger" / "taller" / "wider"
+    "Sara, merge"    "split it"    "turn off auto merge"    "turn on auto merge"
+    "Sara, load a model"                   file picker (STL OBJ PLY GLB GLTF OFF)
+    "Sara, list the parts"                 what can be animated in this model
+    "Sara, spin the blades"                "stop the blades" "faster" "reverse"
+    "Sara, select part 3" / "next part"    then "spin it"
+    "Sara, save"                           exports STL + PLY
+    "Sara, scan this"                      then hold the object in the box (see SCANNING)
+    "Sara, merge the pyramid onto the cube"    self-aligns, then merges
+    "Sara, align it"   "auto align on/off"     "smooth it"   "original colours"
+    "Sara, show me options on aeroplane engine"   then "select option 2" / "open option 2"
+    "Sara, add an engine"  "start the engine"  "thrust to 80 percent"  "engine off"
+
+KEYBOARD
+    1-6 add shape   M merge   U split   A auto-merge on/off   L load model
+    T type a command   TAB next shape   P next part   Y spin part
+    [ ] depth back/forward   C colour   V style   D duplicate   X delete
+    S save   R reset   +/- resize   H hide panels   F fullscreen   Q quit
+    K scan   SPACE capture   ENTER finish scan   G align   E engine on/off   , . thrust -/+
+
+SCANNING
+    Say "Sara, scan this" (or press K). 1) Take your hand out of view while it learns the
+    background. 2) Hold the object in your hand inside the green box, still, for a second.
+    3) Turn it 90 degrees so its front face swings to your LEFT, hold still again.
+    It captures 4 views (SPACE captures now, ENTER builds early) and builds the model.
+    Works best with opaque, matte, contrasting objects in even light, held by the edge.
+    Handles and holes are lost (silhouette based). If the result is mirrored, set SCAN_TURN = -1.
+
+INSTALL
+    python -m pip install opencv-python mediapipe moderngl trimesh numpy
+    python -m pip install SpeechRecognition pyaudio          (microphone)
+    python -m pip install edge-tts                           (human-like voice)
+    python -m pip install scipy scikit-image                 (scanning)
+    Optional: set SKETCHFAB_TOKEN (free) to download online 3D models straight into the app
+
+RUN
+    python sara_v11.py
+"""
+
+import os
+
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "2")
+
+import asyncio
+import hashlib
+import math
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import json
+import urllib.parse
+import urllib.request
+import webbrowser
+import zipfile
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision
+import moderngl
+import trimesh
+
+try:
+    import edge_tts
+    HAS_EDGE = True
+except ImportError:
+    HAS_EDGE = False
+try:
+    import pyttsx3
+    HAS_TTS = True
+except ImportError:
+    HAS_TTS = False
+try:
+    import speech_recognition as sr
+    HAS_SR = True
+except ImportError:
+    HAS_SR = False
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+W, H = 1280, 720
+CAMERA_INDEX = 0
+DET_W, DET_H = 640, 360         # hand detection runs on a smaller copy (faster)
+RENDER_SCALE = 1.0              # lower to 0.75 for more FPS on weak GPUs
+ENABLE_GLOW = True              # cheap bloom; set False for more FPS
+BG_BRIGHTNESS = 0.62
+DEFAULT_STYLE = "solid"         # "solid" shows depth best; "holo" / "wire" also work
+
+# Voice. Neural female voices (need `pip install edge-tts` + internet):
+#   en-IN-NeerjaNeural  en-US-AriaNeural  en-US-JennyNeural  en-GB-SoniaNeural
+VOICE_NAME = "en-IN-NeerjaNeural"
+VOICE_RATE = "+4%"
+VOICE_PITCH = "+0Hz"
+STT_LANGUAGE = "en-IN"          # speech recognition accent: en-US, en-GB, en-IN ...
+WAKE_WINDOW = 8.0               # seconds Sara keeps listening after just "Sara"
+
+# 3D world
+CAM_Z = 5.0
+FOV = 45.0
+FLOOR_Y = -2.0
+Z_MIN, Z_MAX = -8.0, 3.0        # depth range (Z+ is toward you)
+
+# Gestures
+PINCH_ON, PINCH_OFF = 0.25, 0.38
+HAND_DEPTH = True               # push/pull your pinching hand to change depth
+DEPTH_GAIN, DEPTH_DEADZONE = 3.5, 0.12
+MIN_SCALE, MAX_SCALE = 0.1, 4.0
+
+# Auto-merge / snapping (world units; a unit cube is 1.1 wide by default)
+AUTO_MERGE = True               # merge automatically when you drop a shape onto another
+AUTO_ALIGN = True               # ...and self-align it (orientation, flush contact, centring)
+ALIGN_CENTER_FRAC = 0.75        # centre on the target face unless you dropped it this far off-centre
+SNAP_ABS, SNAP_REL, SNAP_MAX = 0.3, 0.4, 0.9
+SNAP_Z_FACTOR = 1.6             # depth is the noisiest axis, so it gets more slack
+DRAG_MIN_PX = 25                # a drop only counts if you actually moved it
+
+MAX_PARTS = 200
+MAX_MODEL_FACES = 120000
+SPIN_SPEED = 8.0                # radians/second for animated parts
+MAX_PARTICLES = 6000            # exhaust particles
+
+# Scanning an object held in your hand
+SCAN_VIEWS = 4                  # views captured, turning the object 90 degrees between them
+SCAN_GRID = 96                  # voxel resolution of the reconstruction
+SCAN_ROI = (0.24, 0.15, 0.76, 0.84)   # scan box as fractions of the screen (x0, y0, x1, y1)
+SCAN_DIFF = 32                  # background-difference threshold
+SCAN_BG_FRAMES = 20
+SCAN_STABLE = 1.0               # seconds the object must stay still before auto-capture
+SCAN_MIN_TRAVEL = 60            # hand travel (px) that counts as "turned the object"
+SCAN_TURN = 1.0                 # set to -1.0 if scanned models come out mirrored
+
+# Online options
+SKETCHFAB_TOKEN = os.environ.get("SKETCHFAB_TOKEN", "")   # free token enables downloading models
+WEB_TIMEOUT = 8
+MAX_OPTIONS = 6
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+             "hand_landmarker/float16/1/hand_landmarker.task")
+
+COLORS = {
+    "red": (0.95, 0.15, 0.15), "green": (0.15, 0.95, 0.30),
+    "blue": (0.15, 0.45, 1.00), "cyan": (0.00, 0.85, 1.00),
+    "yellow": (1.00, 0.90, 0.15), "purple": (0.65, 0.25, 1.00),
+    "orange": (1.00, 0.50, 0.05), "pink": (1.00, 0.30, 0.65),
+    "amber": (1.00, 0.68, 0.10), "white": (0.95, 0.95, 1.00),
+}
+COLOR_ALIASES = {"violet": "purple", "magenta": "pink", "gold": "amber",
+                 "golden": "amber", "teal": "cyan", "turquoise": "cyan",
+                 "lime": "green", "grey": "white", "gray": "white"}
+COLOR_CYCLE = list(COLORS.keys())
+STYLE_ID = {"holo": 0, "solid": 1, "wire": 2}
+STYLE_CYCLE = ["holo", "solid", "wire"]
+
+# HUD colours (BGR order, as OpenCV expects)
+C_CYAN, C_BLUE, C_AMBER = (255, 225, 40), (255, 140, 30), (20, 170, 255)
+C_GREEN, C_WHITE, C_RED = (110, 255, 90), (240, 240, 240), (70, 70, 255)
+C_DIM, C_EDGE = (150, 120, 70), (90, 75, 40)
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15),
+    (15, 16), (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
+]
+
+
+def rgb_to_bgr(rgb):
+    return int(rgb[2] * 255), int(rgb[1] * 255), int(rgb[0] * 255)
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+# ---------------------------------------------------------------------------
+# Small 4x4 matrix helpers (column-vector convention, no extra dependencies)
+# ---------------------------------------------------------------------------
+def perspective(fov_deg, aspect, near, far):
+    f = 1.0 / math.tan(math.radians(fov_deg) / 2.0)
+    m = np.zeros((4, 4), np.float32)
+    m[0, 0], m[1, 1] = f / aspect, f
+    m[2, 2] = (far + near) / (near - far)
+    m[2, 3] = 2.0 * far * near / (near - far)
+    m[3, 2] = -1.0
+    return m
+
+
+def translate(x, y, z):
+    m = np.eye(4, dtype=np.float32)
+    m[:3, 3] = (x, y, z)
+    return m
+
+
+def scale_m(sx, sy, sz):
+    return np.diag([sx, sy, sz, 1.0]).astype(np.float32)
+
+
+def rot_x(a):
+    c, s = math.cos(a), math.sin(a)
+    m = np.eye(4, dtype=np.float32)
+    m[1, 1], m[1, 2], m[2, 1], m[2, 2] = c, -s, s, c
+    return m
+
+
+def rot_y(a):
+    c, s = math.cos(a), math.sin(a)
+    m = np.eye(4, dtype=np.float32)
+    m[0, 0], m[0, 2], m[2, 0], m[2, 2] = c, s, -s, c
+    return m
+
+
+def unit(v):
+    v = np.asarray(v, np.float32)
+    n = float(np.linalg.norm(v))
+    return v / n if n > 1e-8 else np.array([0, 1, 0], np.float32)
+
+
+def axis_angle(axis, ang):
+    x, y, z = unit(axis)
+    c, s = math.cos(ang), math.sin(ang)
+    C = 1 - c
+    m = np.eye(4, dtype=np.float32)
+    m[:3, :3] = [[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+                 [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+                 [z * x * C - y * s, z * y * C + x * s, c + z * z * C]]
+    return m
+
+
+def gl_bytes(m):
+    """numpy (row-major) matrix -> bytes in OpenGL's column-major order."""
+    return np.ascontiguousarray(m.T, dtype=np.float32).tobytes()
+
+
+def rot_between(a, b):
+    """3x3 rotation taking unit vector a onto unit vector b."""
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    a = a / (np.linalg.norm(a) + 1e-12)
+    b = b / (np.linalg.norm(b) + 1e-12)
+    c = float(a @ b)
+    if c > 1 - 1e-9:
+        return np.eye(3)
+    if c < -1 + 1e-9:
+        axis = np.cross(a, [1.0, 0.0, 0.0])
+        if np.linalg.norm(axis) < 1e-6:
+            axis = np.cross(a, [0.0, 1.0, 0.0])
+        return axis_angle(axis, math.pi)[:3, :3].astype(np.float64)
+    v = np.cross(a, b)
+    return axis_angle(v, math.atan2(float(np.linalg.norm(v)), c))[:3, :3].astype(np.float64)
+
+
+def smooth_mesh(mesh, iters=3, lam=0.5):
+    """Laplacian smoothing that keeps the overall size."""
+    v = np.asarray(mesh.vertices, np.float64).copy()
+    e = mesh.edges_unique
+    lo0, hi0 = v.min(0), v.max(0)
+    for _ in range(iters):
+        acc, cnt = np.zeros_like(v), np.zeros(len(v))
+        np.add.at(acc, e[:, 0], v[e[:, 1]])
+        np.add.at(acc, e[:, 1], v[e[:, 0]])
+        np.add.at(cnt, e[:, 0], 1.0)
+        np.add.at(cnt, e[:, 1], 1.0)
+        v += lam * (acc / np.maximum(cnt, 1.0)[:, None] - v)
+    lo1, hi1 = v.min(0), v.max(0)
+    v = (v - (lo1 + hi1) / 2) * ((hi0 - lo0) / np.maximum(hi1 - lo1, 1e-9)) + (lo0 + hi0) / 2
+    return trimesh.Trimesh(v, mesh.faces, process=False)
+
+
+# ---------------------------------------------------------------------------
+# GPU shaders
+# ---------------------------------------------------------------------------
+VERT_SHADER = """
+#version 330
+uniform mat4 mvp;
+uniform mat4 model;
+uniform mat3 normal_mat;
+in vec3 in_position;
+in vec3 in_normal;
+in vec3 in_color;
+in vec3 in_bary;
+in vec3 in_flags;
+out vec3 v_normal;
+out vec3 v_world;
+out vec3 v_color;
+out vec3 v_bary;
+out vec3 v_flags;
+void main() {
+    v_world  = (model * vec4(in_position, 1.0)).xyz;
+    v_normal = normalize(normal_mat * in_normal);
+    v_color  = in_color;
+    v_bary   = in_bary;
+    v_flags  = in_flags;
+    gl_Position = mvp * vec4(in_position, 1.0);
+}
+"""
+
+FRAG_SHADER = """
+#version 330
+in vec3 v_normal;
+in vec3 v_world;
+in vec3 v_color;
+in vec3 v_bary;
+in vec3 v_flags;
+uniform float time;
+uniform int   style;
+uniform float selected;
+uniform float focus;
+uniform float held;
+uniform vec3  cam_pos;
+uniform vec3  u_color;
+uniform float u_override;
+out vec4 f_color;
+
+void main() {
+    vec3 base = mix(v_color, u_color, u_override);
+    vec3 n = normalize(v_normal);
+    vec3 vdir = normalize(cam_pos - v_world);
+    if (dot(n, vdir) < 0.0) n = -n;
+    float ndv  = clamp(dot(n, vdir), 0.0, 1.0);
+    float fres = pow(1.0 - ndv, 2.5);
+    float dist = length(cam_pos - v_world);
+    float fog  = clamp((dist - 4.0) / 10.0, 0.0, 1.0);
+
+    vec3 d = v_bary + (1.0 - v_flags) * 10.0;
+    float e = min(min(d.x, d.y), d.z);
+    float edge = 1.0 - smoothstep(0.0, fwidth(e) * 1.6 + 1e-5, e);
+
+    vec3 L1 = normalize(vec3(0.5, 0.8, 0.6));
+    vec3 L2 = normalize(vec3(-0.6, -0.2, 0.5));
+    float diff = max(dot(n, L1), 0.0) * 0.8 + max(dot(n, L2), 0.0) * 0.35;
+    float scan = 0.86 + 0.14 * sin(v_world.y * 70.0 - time * 3.0);
+    vec3 edge_col = mix(base, vec3(1.0), 0.5) * 1.5;
+
+    vec3 rgb;
+    float a;
+    if (style == 1) {                           // solid
+        vec3 h = normalize(L1 + vdir);
+        float spec = pow(max(dot(n, h), 0.0), 40.0);
+        rgb = base * (0.10 + diff * 0.62) + vec3(spec) * 0.35 + base * fres * 0.35;
+        rgb = mix(rgb, edge_col * 0.8, edge * 0.45);
+        a = 1.0;
+    } else if (style == 2) {                    // wireframe
+        a = clamp(edge + fres * 0.12, 0.0, 1.0);
+        rgb = edge_col * a * scan;
+    } else {                                    // hologram
+        float body_a = clamp(0.28 + fres * 0.55, 0.0, 0.85);
+        vec3 body = base * (0.30 + diff * 0.6) * scan + base * fres * 1.4;
+        rgb = body * body_a + edge_col * edge * 0.9;
+        a = clamp(body_a * 0.6 + edge, 0.0, 1.0);
+    }
+
+    float pulse = 0.65 + 0.35 * sin(time * 6.0);
+    vec3 glow = vec3(0.1, 0.9, 1.0) * fres * pulse * selected * 0.7
+              + vec3(1.0, 0.68, 0.1) * (fres * 1.4 + 0.08) * pulse * focus;
+    rgb += glow;
+    a = clamp(a + length(glow) * 0.6, 0.0, 1.0);
+    rgb *= (1.0 + held * 0.35) * (1.0 - 0.5 * fog);       // depth cue
+    if (style != 1) a *= (1.0 - 0.25 * fog);
+    f_color = vec4(rgb, a);                               // premultiplied alpha
+}
+"""
+
+LINE_VERT = """
+#version 330
+uniform mat4 mvp;
+in vec3 in_position;
+in vec4 in_color;
+out vec4 v_color;
+void main() {
+    v_color = in_color;
+    gl_Position = mvp * vec4(in_position, 1.0);
+}
+"""
+
+LINE_FRAG = """
+#version 330
+in vec4 v_color;
+out vec4 f_color;
+void main() { f_color = vec4(v_color.rgb * v_color.a, v_color.a); }
+"""
+
+
+PT_VERT = """
+#version 330
+uniform mat4 vp;
+uniform float px_scale;
+in vec3 in_position;
+in float in_life;
+in float in_size;
+out float v_life;
+void main() {
+    vec4 p = vp * vec4(in_position, 1.0);
+    gl_Position = p;
+    gl_PointSize = clamp(in_size * px_scale / max(p.w, 0.5), 2.0, 90.0);
+    v_life = in_life;
+}
+"""
+
+PT_FRAG = """
+#version 330
+in float v_life;
+out vec4 f_color;
+void main() {
+    vec2 q = gl_PointCoord * 2.0 - 1.0;
+    float r2 = dot(q, q);
+    if (r2 > 1.0) discard;
+    float soft = (1.0 - r2) * (1.0 - r2);
+    vec3 hot = vec3(1.0, 0.92, 0.75);
+    vec3 mid = vec3(1.0, 0.45, 0.12);
+    vec3 cold = vec3(0.30, 0.42, 0.75);
+    vec3 col = v_life < 0.35 ? mix(hot, mid, v_life / 0.35)
+                             : mix(mid, cold, clamp((v_life - 0.35) / 0.65, 0.0, 1.0));
+    float a = (1.0 - v_life) * soft;
+    f_color = vec4(col * a * 1.3, a);
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Geometry
+# ---------------------------------------------------------------------------
+def edge_flags(mesh, hide_below_deg):
+    """Per-face flags: which of a triangle's 3 edges are drawn as wire lines.
+    Edges between nearly-flat neighbours are hidden (0 = show all, >=180 = none)."""
+    n = len(mesh.faces)
+    if hide_below_deg >= 180:
+        return np.zeros((n, 3), np.float32)
+    flags = np.ones((n, 3), np.float32)
+    if hide_below_deg <= 0 or n == 0 or len(mesh.face_adjacency) == 0:
+        return flags
+    keep = mesh.face_adjacency_angles < math.radians(hide_below_deg)
+    adj, edges = mesh.face_adjacency[keep], mesh.face_adjacency_edges[keep]
+    for col in (0, 1):
+        f = adj[:, col]
+        fv = mesh.faces[f]
+        opposite = (fv != edges[:, 0:1]) & (fv != edges[:, 1:2])
+        flags[f, opposite.argmax(axis=1)] = 0.0
+    return flags
+
+
+def build_vertex_data(mesh, face_colors, flags):
+    faces = len(mesh.faces)
+    pos = mesh.triangles.astype(np.float32).reshape(-1, 3)
+    nrm = np.repeat(mesh.face_normals.astype(np.float32), 3, axis=0)
+    col = np.repeat(face_colors.astype(np.float32), 3, axis=0)
+    bary = np.tile(np.eye(3, dtype=np.float32), (faces, 1))
+    flg = np.repeat(flags.astype(np.float32), 3, axis=0)
+    return np.hstack([pos, nrm, col, bary, flg]).astype(np.float32)
+
+
+class Geometry:
+    """One mesh on the GPU. Vertices live in the owning object's local space."""
+
+    def __init__(self, renderer, mesh, face_colors, flags):
+        self.mesh = mesh
+        self.face_colors = np.asarray(face_colors, np.float32)
+        self.flags = np.asarray(flags, np.float32)
+        self._hull = self._facets = None
+        data = build_vertex_data(mesh, self.face_colors, self.flags)
+        self.vbo = renderer.ctx.buffer(data.tobytes())
+        self.vao = renderer.ctx.vertex_array(
+            renderer.prog,
+            [(self.vbo, "3f 3f 3f 3f 3f", "in_position", "in_normal",
+              "in_color", "in_bary", "in_flags")])
+
+    def release(self):
+        self.vao.release()
+        self.vbo.release()
+
+    @property
+    def hull(self):
+        """Points whose extremes match the mesh's (used for contact / alignment maths)."""
+        if self._hull is None:
+            v = np.asarray(self.mesh.vertices, np.float64)
+            if len(v) > 3000:
+                v = v[:: len(v) // 2000 + 1]
+                lo, hi = np.asarray(self.mesh.bounds, np.float64)
+                corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+                                    for z in (lo[2], hi[2])])
+                v = np.vstack([v, corners])
+            self._hull = v
+        return self._hull
+
+    @property
+    def facets(self):
+        if self._facets is None:
+            try:
+                self._facets = compute_facets(self.mesh) if len(self.mesh.faces) <= 60000 else []
+            except Exception:
+                self._facets = []
+        return self._facets
+
+
+def compute_facets(mesh, min_frac=0.04, max_n=8):
+    """Big flat faces of a mesh as {n, c, area} in local space (numpy only)."""
+    if len(mesh.faces) == 0:
+        return []
+    n = np.asarray(mesh.face_normals, np.float64)
+    a = np.asarray(mesh.area_faces, np.float64)
+    c = np.asarray(mesh.triangles_center, np.float64)
+    off = np.einsum("ij,ij->i", n, c)
+    key = np.round(np.column_stack([n * 40.0, off * 40.0])).astype(np.int64)
+    _, inv = np.unique(key, axis=0, return_inverse=True)
+    inv = np.asarray(inv).reshape(-1)
+    area = np.bincount(inv, weights=a)
+    total = float(area.sum()) or 1.0
+    out = []
+    for g in np.argsort(area)[::-1][:max_n]:
+        if area[g] < min_frac * total:
+            break
+        sel = inv == g
+        w = a[sel]
+        nn = (n[sel] * w[:, None]).sum(0)
+        nn /= np.linalg.norm(nn) + 1e-12
+        out.append({"n": nn, "c": (c[sel] * w[:, None]).sum(0) / w.sum(), "area": float(area[g])})
+    return out
+
+
+def normalized(mesh):
+    m = mesh.copy()
+    m.apply_translation(-m.bounds.mean(axis=0))
+    ext = float(m.extents.max())
+    if ext > 0:
+        m.apply_scale(1.0 / ext)
+    return m
+
+
+Z_TO_Y = trimesh.transformations.rotation_matrix(-math.pi / 2, [1, 0, 0])
+
+
+def build_primitive(kind):
+    c = trimesh.creation
+    if kind == "cube":
+        return normalized(c.box(extents=(1, 1, 1))), 20
+    if kind == "pyramid":
+        m = c.cone(radius=0.7071, height=1.0, sections=4)
+        m.apply_transform(Z_TO_Y)
+        m.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 4, [0, 1, 0]))   # edges parallel to axes
+        return normalized(m), 20
+    if kind == "cone":
+        m = c.cone(radius=0.5, height=1.0, sections=48)
+        m.apply_transform(Z_TO_Y)
+        return normalized(m), 25
+    if kind == "cylinder":
+        m = c.cylinder(radius=0.5, height=1.0, sections=48)
+        m.apply_transform(Z_TO_Y)
+        return normalized(m), 25
+    if kind == "sphere":
+        return normalized(c.icosphere(subdivisions=2, radius=0.5)), 0
+    if kind == "torus":
+        return normalized(c.torus(major_radius=0.36, minor_radius=0.14,
+                                  major_sections=36, minor_sections=14)), 0
+    raise ValueError(f"unknown shape {kind}")
+
+
+def mesh_face_colors(mesh):
+    try:
+        if mesh.visual.kind in ("face", "vertex"):
+            return np.asarray(mesh.visual.face_colors, np.float32)[:, :3] / 255.0
+    except Exception:
+        pass
+    return None
+
+
+def split_into_parts(mesh, base):
+    """A single mesh made of separate pieces becomes several parts."""
+    if len(mesh.faces) > 300000:
+        return [(base, mesh)]
+    try:
+        comps = mesh.split(only_watertight=False)
+    except Exception:
+        return [(base, mesh)]
+    if len(comps) <= 1:
+        return [(base, mesh)]
+    comps = sorted(comps, key=lambda c: len(c.faces), reverse=True)
+    keep, rest = comps[:MAX_PARTS - 1], comps[MAX_PARTS - 1:]
+    out = [(f"Part {i + 1}", c) for i, c in enumerate(keep)]
+    if rest:
+        out.append(("Small parts", trimesh.util.concatenate(rest)))
+    return out
+
+
+def load_model_parts(path):
+    """Load a 3D file as a list of (part name, mesh, colours or None), jointly normalised.
+    Scene files (GLB/GLTF/OBJ groups) keep their node names; single meshes are split
+    into connected pieces."""
+    ext = os.path.splitext(path)[1].lower()
+    loaded = trimesh.load(path)
+    base = os.path.splitext(os.path.basename(path))[0]
+    raw = []
+    if isinstance(loaded, trimesh.Scene):
+        for node in loaded.graph.nodes_geometry:
+            T, gname = loaded.graph[node]
+            g = loaded.geometry.get(gname)
+            if isinstance(g, trimesh.Trimesh) and len(g.faces):
+                m = g.copy()
+                m.apply_transform(T)
+                raw.append((str(node), m))
+        if len(raw) == 1:
+            raw = split_into_parts(raw[0][1], raw[0][0])
+    elif isinstance(loaded, trimesh.Trimesh) and len(loaded.faces):
+        raw = split_into_parts(loaded, base)
+    if not raw:
+        raise ValueError("no triangle mesh found in that file")
+
+    if len(raw) > MAX_PARTS:
+        extra = trimesh.util.concatenate([m for _, m in raw[MAX_PARTS - 1:]])
+        raw = raw[:MAX_PARTS - 1] + [("Other parts", extra)]
+    seen = {}
+    for i, (name, m) in enumerate(raw):                    # unique names
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] > 1:
+            raw[i] = (f"{name} {seen[name]}", m)
+    if ext in (".stl", ".ply", ".off", ".3mf"):            # usually Z-up
+        for _, m in raw:
+            m.apply_transform(Z_TO_Y)
+    if len(raw) == 1 and len(raw[0][1].faces) > MAX_MODEL_FACES:
+        try:
+            raw[0] = (raw[0][0], raw[0][1].simplify_quadric_decimation(face_count=MAX_MODEL_FACES))
+        except Exception:
+            pass
+
+    total_faces = sum(len(m.faces) for _, m in raw)
+    if total_faces > 600000:
+        raise ValueError(f"model too heavy ({total_faces} faces)")
+    allv = np.vstack([m.vertices for _, m in raw])
+    lo, hi = allv.min(0), allv.max(0)
+    center, ext_size = (lo + hi) / 2, float((hi - lo).max())
+    out = []
+    for name, m in raw:
+        colors = mesh_face_colors(m)
+        m.apply_translation(-center)
+        if ext_size > 0:
+            m.apply_scale(1.0 / ext_size)
+        out.append((name, m, colors))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# GPU renderer: 3D world, depth testing, floor grid, drop-lines
+# ---------------------------------------------------------------------------
+def build_grid():
+    """Floor grid + axes as coloured line segments: [x, y, z, r, g, b, a]."""
+    verts = []
+
+    def line(p0, p1, rgb, alpha, fade=True, n=16):
+        p0, p1 = np.array(p0, np.float32), np.array(p1, np.float32)
+        for i in range(n):
+            for k in (i, i + 1):
+                pt = p0 + (p1 - p0) * (k / n)
+                al = alpha
+                if fade:
+                    d = math.sqrt(pt[0] ** 2 + FLOOR_Y ** 2 + (CAM_Z - pt[2]) ** 2)
+                    al *= clamp(1 - (d - 3) / 16, 0.0, 1.0)
+                verts.append((*pt, *rgb, al))
+
+    z0, z1 = Z_MIN - 1, Z_MAX + 0.5
+    for xi in range(-8, 9):
+        main = xi == 0
+        line((xi, FLOOR_Y, z0), (xi, FLOOR_Y, z1),
+             (0.3, 0.6, 1.0) if main else (0.1, 0.65, 0.9), 0.55 if main else 0.28)
+    for zi in range(int(Z_MIN) - 1, int(Z_MAX) + 2):
+        main = zi == 0
+        line((-8, FLOOR_Y, zi), (8, FLOOR_Y, zi),
+             (0.3, 0.6, 1.0) if main else (0.1, 0.65, 0.9), 0.55 if main else 0.28)
+    line((0, FLOOR_Y, 0), (1.6, FLOOR_Y, 0), (1.0, 0.25, 0.25), 0.95, False, 2)    # X red
+    line((0, FLOOR_Y, 0), (0, FLOOR_Y + 1.6, 0), (0.3, 1.0, 0.3), 0.95, False, 2)  # Y green
+    line((0, FLOOR_Y, 0), (0, FLOOR_Y, 1.6), (0.3, 0.5, 1.0), 0.95, False, 2)      # Z blue
+    return np.array(verts, np.float32)
+
+
+class Renderer:
+    def __init__(self, width, height, scale=1.0):
+        self.W, self.H = width, height
+        self.rw, self.rh = int(width * scale), int(height * scale)
+        self.ctx = moderngl.create_standalone_context()
+        self.prog = self.ctx.program(vertex_shader=VERT_SHADER, fragment_shader=FRAG_SHADER)
+        self.line_prog = self.ctx.program(vertex_shader=LINE_VERT, fragment_shader=LINE_FRAG)
+        self.fbo = self.ctx.framebuffer(
+            color_attachments=[self.ctx.texture((self.rw, self.rh), 4)],
+            depth_attachment=self.ctx.depth_renderbuffer((self.rw, self.rh)))
+        self.aspect = width / height
+        self.tan_half = math.tan(math.radians(FOV) / 2.0)
+        proj = perspective(FOV, self.aspect, 0.1, 50.0)
+        proj[1, 1] *= -1.0              # flip Y so the readback is already top-down
+        self.vp = proj @ translate(0, 0, -CAM_Z)
+
+        grid = build_grid()
+        self.grid_n = len(grid)
+        self.grid_vbo = self.ctx.buffer(grid.tobytes())
+        self.grid_vao = self.ctx.vertex_array(
+            self.line_prog, [(self.grid_vbo, "3f 4f", "in_position", "in_color")])
+        self.dyn_vbo = self.ctx.buffer(reserve=512 * 1024)
+        self.dyn_vao = self.ctx.vertex_array(
+            self.line_prog, [(self.dyn_vbo, "3f 4f", "in_position", "in_color")])
+        self.pt_prog = self.ctx.program(vertex_shader=PT_VERT, fragment_shader=PT_FRAG)
+        self.pt_vbo = self.ctx.buffer(reserve=MAX_PARTICLES * 5 * 4)
+        self.pt_vao = self.ctx.vertex_array(
+            self.pt_prog, [(self.pt_vbo, "3f 1f 1f", "in_position", "in_life", "in_size")])
+
+    # Screen <-> world. An object's (x, y) is where it appears on screen; z is its
+    # depth. Changing z moves it toward/away from the camera along that same ray.
+    def unproject(self, x, y, z=0.0):
+        d = CAM_Z - z
+        return ((x / self.W * 2 - 1) * d * self.tan_half * self.aspect,
+                -(y / self.H * 2 - 1) * d * self.tan_half, z)
+
+    def project(self, wx, wy, wz):
+        d = max(CAM_Z - wz, 0.5)
+        return ((wx / (d * self.tan_half * self.aspect) + 1) / 2 * self.W,
+                (1 - wy / (d * self.tan_half)) / 2 * self.H)
+
+    def px_per_world(self, z=0.0):
+        return self.H / (2 * (CAM_Z - z) * self.tan_half)
+
+    def _set_transform(self, M):
+        p = self.prog
+        p["model"].write(gl_bytes(M))
+        p["mvp"].write(gl_bytes(self.vp @ M))
+        p["normal_mat"].write(np.ascontiguousarray(np.linalg.inv(M[:3, :3]), np.float32).tobytes())
+
+    def _drop_lines(self, objects):
+        rows = []
+        for o in objects[:200]:
+            wx, wy, wz = self.unproject(o.x, o.y, o.z)
+            rgb = (1.0, 0.7, 0.15) if o.selected else (0.2, 0.85, 1.0)
+            a = 0.9 if o.selected else 0.55
+            rows.append((wx, wy, wz, *rgb, a))
+            rows.append((wx, FLOOR_Y, wz, *rgb, a * 0.5))
+            r = max(0.2, 0.5 * o.scale * float(max(o.stretch[0], o.stretch[2])))
+            for i in range(16):
+                for k in (i, i + 1):
+                    ang = 2 * math.pi * k / 16
+                    rows.append((wx + r * math.cos(ang), FLOOR_Y, wz + r * math.sin(ang), *rgb, a * 0.6))
+        return np.array(rows, np.float32)
+
+    def render(self, objects, t, particles=None):
+        """Draw the 3D world; returns an RGBA uint8 image (premultiplied alpha)."""
+        p = self.prog
+        self.fbo.use()
+        self.fbo.depth_mask = True                       # required for the depth clear
+        self.fbo.clear(0.0, 0.0, 0.0, 0.0)
+        self.ctx.enable(moderngl.DEPTH_TEST | moderngl.BLEND)
+        p["time"].value = t
+        p["cam_pos"].value = (0.0, 0.0, CAM_Z)
+
+        # 1) solid shapes write depth (Z-buffer) so they truly hide what is behind them
+        self.ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
+        for o in objects:
+            if o.style == "solid":
+                self._draw_object(o)
+
+        # 2) floor grid, axes, drop-lines: depth-tested against the solids, additive
+        self.fbo.depth_mask = False
+        self.ctx.blend_func = moderngl.ONE, moderngl.ONE
+        lp = self.line_prog
+        lp["mvp"].write(gl_bytes(self.vp))
+        self.grid_vao.render(moderngl.LINES, vertices=self.grid_n)
+        dyn = self._drop_lines(objects)
+        if len(dyn):
+            self.dyn_vbo.write(dyn.tobytes())
+            self.dyn_vao.render(moderngl.LINES, vertices=len(dyn))
+
+        # exhaust particles: glowing additive points, depth-tested against solids
+        if particles is not None and len(particles):
+            self.ctx.enable(moderngl.DEPTH_TEST | moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
+            self.pt_vbo.write(particles[:MAX_PARTICLES].tobytes())
+            self.pt_prog["vp"].write(gl_bytes(self.vp))
+            self.pt_prog["px_scale"].value = self.rh / (2.0 * self.tan_half)
+            self.pt_vao.render(moderngl.POINTS, vertices=min(len(particles), MAX_PARTICLES))
+
+        # 3) see-through shapes: depth-tested against solids, blended additively
+        for o in objects:
+            if o.style != "solid":
+                self._draw_object(o)
+
+        raw = self.fbo.read(components=4)
+        return np.frombuffer(raw, np.uint8).reshape(self.rh, self.rw, 4)
+
+    def _draw_object(self, o):
+        p = self.prog
+        base = o.model_matrix(self)
+        p["style"].value = STYLE_ID[o.style]
+        p["held"].value = 1.0 if o.held else 0.0
+        obj_glow = 1.0 if (o.selected and o.focus is None) else 0.0
+        on_base = False
+        for i, part in enumerate(o.parts):
+            sp = part.spinner
+            if sp is not None and sp.angle != 0.0:
+                self._set_transform(base @ sp.mat)
+                on_base = False
+            elif not on_base:
+                self._set_transform(base)
+                on_base = True
+            p["u_color"].value = tuple(COLORS[part.color_name])
+            p["u_override"].value = 1.0 if part.override else 0.0
+            p["selected"].value = obj_glow
+            p["focus"].value = 1.0 if (o.selected and o.focus == i) else 0.0
+            part.geom.vao.render(moderngl.TRIANGLES)
+
+
+def composite(bg, gl_rgba, width, height):
+    """Blend the premultiplied GL layer over the background (all in OpenCV)."""
+    alpha = cv2.extractChannel(gl_rgba, 3)
+    if cv2.countNonZero(alpha) == 0:
+        return bg
+    bgr = cv2.cvtColor(gl_rgba, cv2.COLOR_RGBA2BGR)
+    if bgr.shape[1] != width:
+        bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_LINEAR)
+        alpha = cv2.resize(alpha, (width, height), interpolation=cv2.INTER_LINEAR)
+    inv = cv2.cvtColor(cv2.bitwise_not(alpha), cv2.COLOR_GRAY2BGR)
+    out = cv2.add(cv2.multiply(bg, inv, scale=1.0 / 255.0), bgr)
+    if ENABLE_GLOW:
+        small = cv2.resize(bgr, (width // 4, height // 4), interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (0, 0), 5)
+        out = cv2.addWeighted(out, 1.0, cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR), 0.5, 0)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Scene: parts, animation, objects
+# ---------------------------------------------------------------------------
+class Spinner:
+    """Rotates one or more parts around an axis through a pivot (object-local space)."""
+
+    def __init__(self, pivot, axis, speed=SPIN_SPEED):
+        self.pivot = np.asarray(pivot, np.float32)
+        self.axis = unit(axis)
+        self.speed = float(speed)
+        self.angle = 0.0
+        self.on = True
+        self.engine_driven = False
+        self.mat = np.eye(4, dtype=np.float32)
+
+    def advance(self, dt):
+        if self.on:
+            self.angle = (self.angle + self.speed * dt) % (2 * math.pi)
+            self.mat = translate(*self.pivot) @ axis_angle(self.axis, self.angle) @ translate(*(-self.pivot))
+
+
+class Part:
+    def __init__(self, geom, name, color_name="cyan", override=True):
+        self.geom, self.name = geom, name
+        self.color_name, self.override = color_name, override
+        self.spinner = None
+
+    def face_colors(self):
+        if self.override:
+            return np.tile(np.array(COLORS[self.color_name], np.float32), (len(self.geom.mesh.faces), 1))
+        return self.geom.face_colors
+
+    def rgb(self):
+        return COLORS[self.color_name] if self.override else (0.7, 0.7, 0.75)
+
+
+class SceneObject:
+    def __init__(self, parts, kind, name, x, y, z=0.0, scale=1.1):
+        self.parts, self.kind, self.name = parts, kind, name
+        self.focus = None                            # index of the highlighted part
+        self.x = self.tx = float(x)
+        self.y = self.ty = float(y)
+        self.z = self.tz = float(z)
+        self.scale = float(scale)
+        self.stretch = np.ones(3, np.float32)
+        self.ax, self.ay = 0.35, 0.6
+        self.style = DEFAULT_STYLE
+        self.R0 = np.eye(4, dtype=np.float32)      # orientation set by self-alignment
+        self.engine = None
+        self.spin, self.spin_speed = False, 1.3
+        self.selected = self.held = False
+        self.refresh_bounds()
+
+    def refresh_bounds(self):
+        lo = np.min([p.geom.mesh.bounds[0] for p in self.parts], axis=0)
+        hi = np.max([p.geom.mesh.bounds[1] for p in self.parts], axis=0)
+        self.local_bounds = (lo, hi)
+
+    def rot4(self):
+        return rot_y(self.ay) @ rot_x(self.ax) @ self.R0
+
+    def model_matrix(self, r, target=False):
+        x, y, z = (self.tx, self.ty, self.tz) if target else (self.x, self.y, self.z)
+        wx, wy, wz = r.unproject(x, y, z)
+        return translate(wx, wy, wz) @ self.rot4() @ scale_m(*(self.stretch * self.scale))
+
+    def part_transform(self, part):
+        sp = part.spinner
+        return sp.mat if (sp is not None and sp.angle != 0.0) else np.eye(4, dtype=np.float32)
+
+    def radius_px(self, r):
+        return max(45.0, 0.58 * r.px_per_world(self.z) * self.scale * float(self.stretch.max()))
+
+    def spinners(self):
+        return list({id(p.spinner): p.spinner for p in self.parts if p.spinner}.values())
+
+    def display_rgb(self):
+        p = self.parts[self.focus] if self.focus is not None else self.parts[0]
+        return p.rgb()
+
+
+# ---------------------------------------------------------------------------
+# Part-name matching ("spin the blades")
+# ---------------------------------------------------------------------------
+SYNONYMS = [{"blade", "fan", "propeller", "prop", "rotor", "turbine", "vane", "impeller", "paddle"},
+            {"wheel", "tire", "tyre", "rim"}, {"gear", "cog", "sprocket"},
+            {"door", "hatch", "panel"}, {"wing", "flap", "aileron"}]
+
+
+def _plural(w):
+    return w[:-1] if len(w) > 3 and w.endswith("s") else w
+
+
+def name_tokens(name):
+    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)
+    return {_plural(t) for t in re.findall(r"[a-z]+|\d+", s.lower())}
+
+
+def match_parts(obj, query):
+    q = [_plural(x) for x in query]
+    scored = []
+    for i, p in enumerate(obj.parts):
+        toks, sc = name_tokens(p.name), 0
+        for t in q:
+            group = next((g for g in SYNONYMS if t in g), {t})
+            if any(e in toks or any(len(e) >= 3 and len(x) >= 3 and (e in x or x in e) for x in toks)
+                   for e in group):
+                sc += 1
+        scored.append((sc, i))
+    best = max((s for s, _ in scored), default=0)
+    return [i for s, i in scored if s == best and s > 0]
+
+
+def auto_axis(points):
+    """Guess a spin axis: disc-like group -> its normal, long group -> its length."""
+    q = points - points.mean(0)
+    if len(q) > 20000:
+        q = q[np.random.choice(len(q), 20000, replace=False)]
+    w, v = np.linalg.eigh(np.cov(q.T))
+    if w[0] < 0.35 * w[1]:
+        return v[:, 0]
+    if w[2] > 2.5 * w[1]:
+        return v[:, 2]
+    return np.array([0, 1, 0], np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Voice command parsing (pure functions, no audio needed)
+# ---------------------------------------------------------------------------
+@dataclass
+class Command:
+    kind: str
+    args: dict = field(default_factory=dict)
+    phrase: str = ""        # "add a cube" -> spoken "Okay, I will add a cube."
+    say: str = ""           # full sentence (greetings/help) overriding phrase
+
+
+SHAPES = {"cube": "cube", "box": "cube", "block": "cube", "pyramid": "pyramid",
+          "triangle": "pyramid", "cone": "cone", "cylinder": "cylinder",
+          "tube": "cylinder", "sphere": "sphere", "ball": "sphere",
+          "globe": "sphere", "orb": "sphere", "torus": "torus", "donut": "torus",
+          "doughnut": "torus", "ring": "torus",
+          "engine": "engine", "turbofan": "engine", "turbojet": "engine"}
+PRIMS = set(SHAPES.values())
+STYLES = {"hologram": "holo", "holographic": "holo", "holo": "holo", "glass": "holo",
+          "ghost": "holo", "solid": "solid", "opaque": "solid", "metal": "solid",
+          "metallic": "solid", "wireframe": "wire", "wire": "wire", "outline": "wire"}
+NUMBERS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+           "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
+NUMBER_TEXT = {1: "a", 2: "two", 3: "three", 4: "four", 5: "five"}
+PART_NUMS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+             "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+WAKE_RE = re.compile(r"\b(sara|sarah|sera|zara|sarra|saara|sarrah|sahra)\b")
+
+GENERIC = set("""it this that the a an please object shape whole everything all around axis x y z
+faster slower quickly fast slow again now on off up down of my its part parts number component
+components spin spinning rotate rotating turn animate run start stop freeze halt pause disable kill
+revolve reverse backwards clockwise counterclockwise to and then begin speed in at for them those these
+more less much little bit direction opposite other way me can you could would will do just also very
+really degrees make paint color colour set change into is are be""".split())
+
+REL_PATTERNS = [
+    ("front", r"\b(?:in front of|infront of|front of)\b"),
+    ("behind", r"\b(?:behind|in back of|at the back of|back of)\b"),
+    ("inside", r"\b(?:inside of|inside|within|into|in the middle of)\b"),
+    ("inside", r"\bin(?= (?:the |a |an )?(?:%s)s?\b)" % "|".join(SHAPES)),
+    ("on", r"\b(?:on top of|on top|above|over|on)\b"),
+    ("under", r"\b(?:underneath|under|below|beneath)\b"),
+    ("left", r"\b(?:to the left of|left of)\b"),
+    ("right", r"\b(?:to the right of|right of|next to|beside)\b"),
+]
+REL_TEXT = {"front": "in front of", "behind": "behind", "inside": "inside", "on": "on top of",
+            "under": "under", "left": "to the left of", "right": "to the right of"}
+MOVE_VERBS = {"move", "push", "pull", "bring", "send", "shift", "slide", "nudge", "lift", "lower",
+              "raise", "drag", "take", "put", "get"}
+DIRS = {"forward": ("z", 1), "forwards": ("z", 1), "closer": ("z", 1), "nearer": ("z", 1),
+        "toward": ("z", 1), "towards": ("z", 1), "front": ("z", 1),
+        "back": ("z", -1), "backward": ("z", -1), "backwards": ("z", -1), "away": ("z", -1),
+        "farther": ("z", -1), "further": ("z", -1), "behind": ("z", -1),
+        "left": ("x", -1), "right": ("x", 1), "up": ("y", 1), "upward": ("y", 1),
+        "down": ("y", -1), "downward": ("y", -1)}
+DIR_TEXT = {("z", 1): "forward", ("z", -1): "back", ("x", -1): "to the left", ("x", 1): "to the right",
+            ("y", 1): "up", ("y", -1): "down"}
+SUBJECT_KINDS = {"color", "style", "scale", "stretch", "spin", "move", "reset", "duplicate", "delete",
+                 "smooth", "restore_colors", "engine", "engine_thrust", "engine_flip"}
+
+
+def strip_wake_word(text):
+    """Return (wake word heard, remaining text cleaned up)."""
+    t = text.lower()
+    found = WAKE_RE.search(t) is not None
+    t = WAKE_RE.sub(" ", t)
+    t = re.sub(r"[^a-z0-9\s]", " ", t.replace("'", ""))
+    return found, re.sub(r"\s+", " ", t).strip()
+
+
+def _stem(w):
+    return w[:-1] if w.endswith("s") and w[:-1] in SHAPES else w
+
+
+def _find_relation(t):
+    for name, pat in REL_PATTERNS:
+        m = re.search(pat, t)
+        if m:
+            return name, m.start(), m.end()
+    return None
+
+
+def _query_tokens(words):
+    return [w for w in words if w not in GENERIC and w not in COLORS and w not in COLOR_ALIASES
+            and w not in STYLES and w not in PART_NUMS and not w.isdigit()]
+
+
+def _part_index(words):
+    for i, w in enumerate(words[:-1]):
+        if w in ("part", "number", "component"):
+            n = words[i + 1]
+            if n.isdigit():
+                return int(n)
+            if n in PART_NUMS:
+                return PART_NUMS[n]
+    return None
+
+
+TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fourty": 40, "fifty": 50, "sixty": 60,
+        "seventy": 70, "eighty": 80, "ninety": 90}
+ONES = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+        "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19}
+
+
+def _parse_percent(words):
+    """'80', 'eighty five', 'full', 'half', 'idle' -> 0..100 (or None)."""
+    for w in words:
+        if w.isdigit() and 0 <= int(w) <= 100:
+            return int(w)
+    for i, w in enumerate(words):
+        if w == "hundred":
+            return 100
+        if w in TENS:
+            nxt = words[i + 1] if i + 1 < len(words) else ""
+            return TENS[w] + (ONES[nxt] if nxt in ONES and 0 < ONES[nxt] < 10 else 0)
+        if w in ONES and ONES[w] >= 10:
+            return ONES[w]
+    if any(w in words for w in ("full", "max", "maximum")):
+        return 100
+    if "half" in words:
+        return 50
+    if "idle" in words:
+        return 15
+    return None
+
+
+def _art(word):
+    return "an" if word[0] in "aeiou" else "a"
+
+
+def _parse_clause(t):
+    words = [_stem(w) for w in t.split()]
+    ws = set(words)
+    if not words:
+        return None
+
+    def has(*keys):
+        return bool(ws & set(keys))
+
+    shape = next((SHAPES[w] for w in words if w in SHAPES), None)
+    color = next((COLOR_ALIASES.get(w, w) for w in words if w in COLORS or w in COLOR_ALIASES), None)
+    style = next((STYLES[w] for w in words if w in STYLES), None)
+    add_verb = has("add", "create", "spawn", "insert", "generate", "build", "draw", "new",
+                   "place", "another", "give") or ("make" in ws and has("a", "an", "two", "three", "four", "five"))
+
+    def S(cmd):
+        if shape and cmd.kind in SUBJECT_KINDS:
+            cmd.args.setdefault("subject", shape)
+        return cmd
+
+    if has("help", "commands") or ("what" in ws and has("do", "say")):
+        return Command("help", say="I can add shapes, move them in three D, put one inside or on top of "
+                       "another, merge and animate parts, and load models. Say Sara, then what you want.")
+    if has("model", "modelling", "modeling") and has("make", "create", "build", "turn", "generate") \
+            and has("hand", "this", "it", "object", "real"):
+        return Command("scan", phrase="start the scanner")
+    if has("scan", "scanning", "scanner"):
+        if has("cancel", "stop", "abort", "quit", "exit"):
+            return Command("scan_cancel", phrase="cancel the scan")
+        return Command("scan", phrase="start the scanner")
+    if has("capture"):
+        return Command("scan_capture", phrase="capture this view")
+    if has("finish", "done", "complete") and not shape:
+        return Command("scan_finish", phrase="build the model")
+
+    # online options: "show me options on aeroplane engine", "select option 2"
+    opt_idx = None
+    for i, w in enumerate(words[:-1]):
+        if w in ("option", "options") and (words[i + 1].isdigit() or words[i + 1] in PART_NUMS):
+            opt_idx = int(words[i + 1]) if words[i + 1].isdigit() else PART_NUMS[words[i + 1]]
+    if opt_idx:
+        return Command("web_pick", {"index": opt_idx, "action": "open" if has("open", "browser", "website", "page") else None},
+                       f"{'open' if has('open', 'browser', 'website', 'page') else 'select'} option {opt_idx}")
+    if has("close", "hide", "dismiss") and has("option", "options", "results", "panel"):
+        return Command("web_close", phrase="close the options")
+    if has("options", "option", "online", "internet", "web", "google", "search"):
+        stop = {"show", "me", "options", "option", "on", "for", "about", "of", "a", "an", "the", "some", "various",
+                "different", "find", "search", "look", "up", "online", "internet", "web", "please", "can", "you",
+                "give", "list", "get", "google", "from", "to", "i", "want", "see", "with", "any", "all", "more"}
+        topic = [w for w in words if w not in stop]
+        if topic and not has("part", "parts"):
+            q = " ".join(topic)
+            return Command("web_search", {"query": q}, f"search online for {q}")
+
+    # engine: "start the engine", "thrust to 80 percent", "engine off"
+    pct = _parse_percent(words)
+    if has("engine", "engines", "thrust", "throttle", "exhaust", "ignite", "ignition", "afterburner") \
+            and not add_verb and not has("blade", "fan", "rotor", "propeller", "turbine", "spin", "rotate"):
+        if has("exhaust", "nozzle") and has("flip", "reverse", "switch", "swap", "other", "opposite"):
+            return Command("engine_flip", phrase="flip the exhaust")
+        off = has("off", "stop", "shut", "kill", "disable", "cut", "shutdown")
+        on_ = has("on", "start", "ignite", "ignition", "activate", "fire", "begin", "boot", "run", "enable", "power")
+        inc, dec = has("increase", "raise", "more", "higher", "up"), has("decrease", "lower", "less", "reduce", "down")
+        if inc or dec:
+            mag = pct / 100.0 if pct is not None else 0.1        # "by 20 percent" -> relative, not absolute
+            delta, pct = (mag if inc else -mag), None
+        else:
+            delta = None
+        thrust_talk = has("thrust", "throttle", "capacity", "percent", "percentage", "full", "max", "maximum", "idle", "half")
+        if off and not on_ and not thrust_talk:
+            return S(Command("engine", {"on": False}, "turn the engine off"))
+        cmds = []
+        if on_ and not thrust_talk or (on_ and pct is not None):
+            cmds.append(S(Command("engine", {"on": True}, "start the engine")))
+        if pct is not None or delta is not None or has("full", "max", "maximum", "idle", "half"):
+            words_txt = f"set the thrust to {pct} percent" if pct is not None else \
+                ("increase the thrust" if (delta or 0) > 0 else "decrease the thrust")
+            cmds.append(S(Command("engine_thrust", {"pct": pct, "delta": delta}, words_txt)))
+        if cmds:
+            return cmds if len(cmds) > 1 else cmds[0]
+
+    if has("smooth", "smoothen", "smoothing", "polish"):
+        return S(Command("smooth", phrase="smooth it"))
+    if has("original", "natural", "restore", "real") and has("color", "colour", "colors", "colours"):
+        return S(Command("restore_colors", phrase="restore the original colours"))
+    if has("align", "aligned", "aligning", "alignment"):
+        if has("auto", "automatic", "automatically", "self", "on", "off", "enable", "disable"):
+            off = has("off", "disable", "stop", "cancel", "no", "never")
+            return Command("autoalign", {"on": not off}, "turn auto align " + ("off" if off else "on"))
+        return Command("align", phrase="align it")
+    if has("auto", "automatic", "automatically", "snap", "snapping", "magnet", "magnetic"):
+        off = has("off", "disable", "stop", "cancel", "no", "never")
+        return Command("automerge", {"on": not off}, "turn auto merge " + ("off" if off else "on"))
+    if (has("list", "show", "name", "tell", "count") and has("part", "parts", "component", "components")) \
+            or ((has("how", "what", "which")) and has("part", "parts", "components")):
+        return Command("list_parts", phrase="list the parts")
+    if has("load", "upload", "import", "browse") \
+            or (has("open") and has("file", "files", "model", "models", "stl", "obj")) \
+            or (has("add", "get", "bring") and has("model", "file", "stl", "obj")):
+        return Command("load", phrase="open the file browser")
+    if has("save", "export"):
+        return Command("save", phrase="save your design")
+    if has("split", "unmerge", "separate", "detach", "explode"):
+        return Command("split", phrase="split it apart")
+    if has("merge", "combine", "fuse", "join", "weld", "unite", "attach"):
+        shapes_all = [SHAPES[_stem(w)] for w in t.split() if _stem(w) in SHAPES]
+        margs = {}
+        if len(shapes_all) >= 2:
+            margs = {"subject": shapes_all[0], "target": shapes_all[1]}
+        elif len(shapes_all) == 1:
+            margs = {"target": shapes_all[0]}
+        if has("on", "onto", "top", "above"):
+            margs["relation"] = "on"
+        elif has("under", "below", "beneath"):
+            margs["relation"] = "under"
+        if margs.get("subject"):
+            phrase = f"merge the {margs['subject']} {'onto' if margs.get('relation') == 'on' else 'with'} the {margs['target']}"
+        elif margs.get("target"):
+            phrase = f"merge it with the {margs['target']}"
+        else:
+            phrase = "merge the shapes"
+        return Command("merge", margs, phrase)
+    if has("clear", "delete", "remove", "erase", "destroy", "trash") and \
+            (has("all", "everything", "scene", "workspace", "screen", "shapes", "objects") or has("clear")):
+        return Command("clear", phrase="clear the workspace")
+    if has("delete", "remove", "erase", "destroy", "trash"):
+        return S(Command("delete", phrase="delete it"))
+    if has("duplicate", "copy", "clone"):
+        return S(Command("duplicate", phrase="duplicate it"))
+
+    # relative placement: "put it inside the cube", "add a sphere on top of the cube"
+    rel = _find_relation(t)
+    if rel:
+        name, s0, e0 = rel
+        before = [SHAPES[_stem(w)] for w in t[:s0].split() if _stem(w) in SHAPES]
+        after = [SHAPES[_stem(w)] for w in t[e0:].split() if _stem(w) in SHAPES]
+        if after:
+            phrase = f"put it {REL_TEXT[name]} the {after[0]}"
+            if add_verb and before:
+                adj = (color + " ") if color else ""
+                return [Command("add", {"shape": before[-1], "color": color, "count": 1},
+                                f"add {_art(adj or before[-1])} {adj}{before[-1]}"),
+                        Command("place", {"relation": name, "target": after[0], "subject": None}, phrase)]
+            return Command("place", {"relation": name, "target": after[0],
+                                     "subject": before[-1] if before else None}, phrase)
+
+    # move in depth / sideways: "move it back", "bring it forward"
+    if has(*MOVE_VERBS) or has("closer", "farther", "further", "nearer"):
+        d = next((DIRS[w] for w in words if w in DIRS), None)
+        if d is None and has("lift", "raise"):
+            d = ("y", 1)
+        if d is None and has("lower"):
+            d = ("y", -1)
+        if d:
+            amt = 0.8 * (2.0 if has("lot", "much", "far") else 0.4 if has("bit", "little", "slightly", "tiny") else 1.0)
+            return S(Command("move", {"axis": d[0], "amount": d[1] * amt}, f"move it {DIR_TEXT[d]}"))
+
+    if shape and add_verb:
+        count = next((NUMBERS[w] for w in words if w in NUMBERS), 1)
+        adj = (color + " ") if color else ""
+        art = NUMBER_TEXT[count]
+        if art == "a":
+            art = _art(adj or shape)
+        return Command("add", {"shape": shape, "color": color, "count": count},
+                       f"add {art} {adj}{shape}{'s' if count > 1 else ''}")
+
+    sel_v = has("select", "choose", "pick", "focus", "highlight", "next", "previous", "deselect", "unselect")
+    idx, q = _part_index(words), _query_tokens(words)
+    if sel_v and (has("part", "parts", "component", "components", "whole", "entire", "deselect", "unselect") or idx):
+        if has("whole", "entire", "object", "everything", "deselect", "unselect") and not idx:
+            return Command("select_part", {"which": "none"}, "select the whole shape")
+        if idx:
+            return Command("select_part", {"index": idx}, f"select part {idx}")
+        if has("next", "previous"):
+            w = "prev" if has("previous") else "next"
+            return Command("select_part", {"which": w}, f"select the {'previous' if w == 'prev' else 'next'} part")
+        return Command("select_part", {"query": q}, "select the " + (" ".join(q) or "part"))
+    qs = [w for w in q if w not in SHAPES]
+    if sel_v and qs and not shape:
+        return Command("select_part", {"query": qs}, "select the " + " ".join(qs))
+    if sel_v:
+        which = "prev" if has("previous") else ("next" if not shape else shape)
+        return Command("select", {"which": which},
+                       "select the " + (which if which in PRIMS else which + " shape"))
+
+    if color:
+        return S(Command("color", {"color": color, "query": qs}, f"paint it {color}"))
+    if style:
+        names = {"holo": "a hologram", "solid": "solid", "wire": "a wireframe"}
+        return S(Command("style", {"style": style}, f"make it {names[style]}"))
+
+    # animate parts / whole shape: "spin the blades", "stop the blades", "faster"
+    spin_v = has("spin", "rotate", "turn", "orbit", "revolve", "whirl", "animate")
+    weak_v = has("start", "run", "activate", "power", "begin")
+    stop_v = has("stop", "freeze", "halt", "pause", "disable", "kill")
+    speed_w = has("faster", "quicker", "slower", "reverse", "backwards", "opposite") or has("speed", "slow")
+    if spin_v or weak_v or stop_v or speed_w:
+        axis = next((w for w in words if w in ("x", "y", "z")), None) if has("axis", "around") else None
+        if q or idx or has("part", "parts"):
+            factor = 0.6 if has("slower", "slow") else 1.6 if has("faster", "quicker", "speed") else None
+            on = False if stop_v else (None if (speed_w and not spin_v and not weak_v) else True)
+            verb = "stop" if stop_v else ("speed up" if factor and factor > 1 and on is None else
+                                          "slow down" if factor and factor < 1 and on is None else "spin")
+            return Command("spin_parts", {"query": q, "index": idx, "on": on, "axis": axis, "factor": factor,
+                                          "reverse": has("reverse", "backwards", "opposite")},
+                           f"{verb} the {' '.join(q) or 'part'}")
+        if stop_v:
+            return S(Command("spin", {"on": False}, "stop the spin"))
+        if spin_v:
+            return S(Command("spin", {"on": True}, "spin it"))
+        if speed_w:
+            return Command("spin_parts", {"query": [], "index": None, "on": None, "axis": None,
+                                          "factor": 0.6 if has("slower", "slow") else 1.6 if has("faster", "quicker", "speed") else None,
+                                          "reverse": has("reverse", "backwards", "opposite")},
+                           "change the speed")
+
+    if has("double", "twice"):
+        return S(Command("scale", {"factor": 2.0}, "double its size"))
+    if has("half"):
+        return S(Command("scale", {"factor": 0.5}, "halve its size"))
+    if has("bigger", "larger", "big", "grow", "enlarge", "expand", "increase") or ("scale" in ws and "up" in ws):
+        return S(Command("scale", {"factor": 1.3}, "make it bigger"))
+    if has("smaller", "small", "shrink", "reduce", "decrease", "tiny", "little") or ("scale" in ws and "down" in ws):
+        return S(Command("scale", {"factor": 0.77}, "make it smaller"))
+    if has("tall", "taller", "higher", "longer", "elongate", "stretch"):
+        return S(Command("stretch", {"axis": "y", "factor": 1.3}, "make it taller"))
+    if has("short", "shorter", "squash", "flatten"):
+        return S(Command("stretch", {"axis": "y", "factor": 0.77}, "make it shorter"))
+    if has("wide", "wider", "fat", "fatter", "thick", "thicker"):
+        return S(Command("stretch", {"axis": "xz", "factor": 1.3}, "make it wider"))
+    if has("narrow", "narrower", "thin", "thinner", "slim"):
+        return S(Command("stretch", {"axis": "xz", "factor": 0.77}, "make it thinner"))
+    if has("reset", "straighten", "upright"):
+        return S(Command("reset", phrase="reset it"))
+    if has("thanks", "thank"):
+        return Command("thanks", say="You're welcome.")
+    if has("hello", "hi", "hey"):
+        return Command("hello", say="Hello. I'm listening.")
+    if shape:
+        return Command("add", {"shape": shape, "color": None, "count": 1}, f"add {_art(shape)} {shape}")
+    return None
+
+
+def parse_commands(text):
+    """Turn a sentence into a list of Commands ('make it tall and blue' -> 2)."""
+    _, t = strip_wake_word(text)
+    clauses = [c.strip() for c in re.split(r"\b(?:and then|then|and)\b", t) if c.strip()]
+    cmds = []
+    for clause in clauses:
+        r = _parse_clause(clause)
+        if isinstance(r, list):
+            cmds.extend(r)
+        elif r:
+            cmds.append(r)
+    return cmds
+
+
+def acknowledgement(cmds):
+    for c in cmds:
+        if c.say:
+            return c.say
+    return "Okay, I will " + " and ".join(c.phrase for c in cmds) + "."
+
+
+# ---------------------------------------------------------------------------
+# Studio: all editing logic
+# ---------------------------------------------------------------------------
+class Studio:
+    def __init__(self, renderer):
+        self.r = renderer
+        self.objects, self.sel = [], None
+        self.prims, self.counters, self.spawn_i = {}, {}, 0
+        self.auto_merge = AUTO_MERGE
+        self.auto_align = AUTO_ALIGN
+        self.merge_candidate = None
+        self.particles = ParticleSystem()
+        self.scanner = None
+        self.web = None
+        self.speak = lambda text: None
+        self.request_file_dialog = lambda: None
+        self.toasts = []
+        self.mode, self.held = None, None        # None | move | rotate | resize
+        self.grab_off, self.rot_last = (0.0, 0.0), None
+        self.r_dist0 = self.r_scale0 = 1.0
+        self.grab_size = self.grab_z = 1.0
+        self.drag_start = None
+
+    # -- helpers ------------------------------------------------------------
+    def toast(self, text, secs=3.0):
+        self.toasts = (self.toasts + [(text, time.time() + secs)])[-3:]
+
+    def select(self, obj):
+        self.sel = obj
+        for o in self.objects:
+            o.selected = o is obj
+
+    def _primitive_geom(self, kind):
+        if kind not in self.prims:
+            mesh, deg = build_primitive(kind)
+            cols = np.tile(np.array(COLORS["cyan"], np.float32), (len(mesh.faces), 1))
+            self.prims[kind] = Geometry(self.r, mesh, cols, edge_flags(mesh, deg))
+        return self.prims[kind]
+
+    def _name(self, label):
+        self.counters[label] = self.counters.get(label, 0) + 1
+        return f"{label} {self.counters[label]}"
+
+    def _free_geom(self, geom):
+        if geom in self.prims.values():
+            return
+        if not any(p.geom is geom for o in self.objects for p in o.parts):
+            geom.release()
+
+    def _free_parts(self, parts):
+        for p in parts:
+            self._free_geom(p.geom)
+
+    def find_object(self, words):
+        """Find a scene object whose kind or name matches the spoken words."""
+        for o in reversed(self.objects):
+            toks = name_tokens(o.name) | {o.kind}
+            if any(_plural(w) in toks for w in words):
+                return o
+        return None
+
+    # -- creation -----------------------------------------------------------
+    def add_shape(self, kind, color=None):
+        if kind == "engine":
+            return self.add_engine()
+        i = self.spawn_i
+        self.spawn_i += 1
+        x = W * (0.30 + 0.08 * (i % 6))
+        y = H * (0.50 + (0.13 if (i // 6) % 2 else 0.0))
+        name = self._name(kind.title())
+        part = Part(self._primitive_geom(kind), name, color or COLOR_CYCLE[i % 6])
+        o = SceneObject([part], kind, name, x, y)
+        self.objects.append(o)
+        self.select(o)
+        return o
+
+    def load_model(self, path):
+        data = load_model_parts(path)
+        total = sum(len(m.faces) for _, m, _ in data)
+        deg = 35 if total <= 60000 else 180
+        parts = []
+        for name, mesh, colors in data:
+            own = colors is not None
+            if colors is None:
+                colors = np.tile(np.array(COLORS["cyan"], np.float32), (len(mesh.faces), 1))
+            parts.append(Part(Geometry(self.r, mesh, colors, edge_flags(mesh, deg)), name, "cyan", not own))
+        i = self.spawn_i
+        self.spawn_i += 1
+        label = os.path.splitext(os.path.basename(path))[0][:14]
+        o = SceneObject(parts, "model", self._name(label), W * (0.42 + 0.06 * (i % 4)), H * 0.5, scale=1.5)
+        self.objects.append(o)
+        self.select(o)
+        return o
+
+    def duplicate(self):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        parts = [Part(p.geom, p.name, p.color_name, p.override) for p in o.parts]
+        c = SceneObject(parts, o.kind, self._name(o.name.rsplit(" ", 1)[0]),
+                        clamp(o.x + 90, 300, W - 300), clamp(o.y + 60, 120, H - 120), o.z, o.scale)
+        c.stretch, c.ax, c.ay, c.style = o.stretch.copy(), o.ax, o.ay, o.style
+        c.R0 = o.R0.copy()
+        self.objects.append(c)
+        self.select(c)
+        return None
+
+    def delete_selected(self):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        self.objects.remove(o)
+        self._free_parts(o.parts)
+        if self.held is o:
+            self.held, self.mode = None, None
+        self.select(self.objects[-1] if self.objects else None)
+        return None
+
+    def clear_all(self):
+        parts = [p for o in self.objects for p in o.parts]
+        self.objects.clear()
+        self._free_parts(parts)
+        self.held, self.mode = None, None
+        self.select(None)
+
+    # -- 3D geometry queries ---------------------------------------------------
+    def world_aabb(self, o, target=False):
+        lo, hi = o.local_bounds
+        corners = np.array([[x, y, z, 1.0] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+                            for z in (lo[2], hi[2])], np.float32)
+        w = (o.model_matrix(self.r, target) @ corners.T).T[:, :3]
+        return w.min(0), w.max(0)
+
+    def place_relative(self, subj, target, relation):
+        """Put `subj` on top of / inside / behind ... `target` in 3D world space."""
+        r = self.r
+        lo_b, hi_b = self.world_aabb(target, True)
+        cb, sb = (lo_b + hi_b) / 2, hi_b - lo_b
+        lo_a, hi_a = self.world_aabb(subj, True)
+        sa, ca = hi_a - lo_a, (lo_a + hi_a) / 2
+        pos = np.array(r.unproject(subj.tx, subj.ty, subj.tz))
+        off = ca - pos
+        if relation == "inside":
+            fit = 0.75 * float(np.min(sb / np.maximum(sa, 1e-6)))
+            if fit < 1.0:
+                subj.scale = max(MIN_SCALE, subj.scale * fit)
+                sa, off = sa * fit, off * fit
+            c = cb
+        elif relation == "on":
+            c = np.array([cb[0], hi_b[1] + sa[1] / 2, cb[2]])
+        elif relation == "under":
+            c = np.array([cb[0], lo_b[1] - sa[1] / 2, cb[2]])
+        elif relation == "behind":
+            c = np.array([cb[0], cb[1], lo_b[2] - sa[2] / 2])
+        elif relation == "front":
+            c = np.array([cb[0], cb[1], hi_b[2] + sa[2] / 2])
+        elif relation == "left":
+            c = np.array([lo_b[0] - sa[0] / 2, cb[1], cb[2]])
+        else:
+            c = np.array([hi_b[0] + sa[0] / 2, cb[1], cb[2]])
+        new = c - off
+        x, y = r.project(*new)
+        subj.tx, subj.ty = clamp(x, 0, W), clamp(y, 0, H)
+        subj.tz = clamp(float(new[2]), Z_MIN, Z_MAX)
+
+    # -- merge with snapping -----------------------------------------------------
+    def _tolerance(self, lo_a, hi_a, lo_b, hi_b):
+        dim = min(float((hi_a - lo_a).max()), float((hi_b - lo_b).max()))
+        t = clamp(max(SNAP_ABS, SNAP_REL * dim), 0.0, SNAP_MAX)
+        return np.array([t, t, t * SNAP_Z_FACTOR])
+
+    def find_contact(self, a):
+        """Nearest other shape that `a` touches, overlaps, or almost touches."""
+        best = None
+        lo_a, hi_a = self.world_aabb(a, True)
+        for b in self.objects:
+            if b is a:
+                continue
+            lo_b, hi_b = self.world_aabb(b, True)
+            tol = self._tolerance(lo_a, hi_a, lo_b, hi_b)
+            gap = np.maximum(lo_a - hi_b, lo_b - hi_a)         # >0 apart, <0 overlapping
+            if np.any(gap > tol):
+                continue
+            inside = (np.all(lo_a >= lo_b - 1e-3) and np.all(hi_a <= hi_b + 1e-3)) or \
+                     (np.all(lo_b >= lo_a - 1e-3) and np.all(hi_b <= hi_a + 1e-3))
+            if inside:                                          # deliberate nesting, leave it
+                continue
+            score = float(gap.max())
+            if best is None or score < best["score"]:
+                best = {"score": score, "b": b, "gap": gap, "tol": tol,
+                        "a": (lo_a, hi_a), "bb": (lo_b, hi_b)}
+        return best
+
+    # -- self-alignment ---------------------------------------------------------
+    def _volume(self, o):
+        lo, hi = self.world_aabb(o, True)
+        return float(np.prod(np.maximum(hi - lo, 1e-6)))
+
+    def pick_roles(self, a, b):
+        """The smaller shape is the one that moves onto the larger one."""
+        return (a, b) if self._volume(a) <= 1.25 * self._volume(b) else (b, a)
+
+    def _nested(self, a, b):
+        lo_a, hi_a = self.world_aabb(a, True)
+        lo_b, hi_b = self.world_aabb(b, True)
+        return bool((np.all(lo_a >= lo_b - 1e-3) and np.all(hi_a <= hi_b + 1e-3))
+                    or (np.all(lo_b >= lo_a - 1e-3) and np.all(hi_b <= hi_a + 1e-3)))
+
+    def _geom_world(self, o):
+        """World-space centre, rotation, scale, hull points and flat faces of an object."""
+        M = o.model_matrix(self.r, True)
+        R = o.rot4()[:3, :3].astype(np.float64)
+        s = (o.stretch * o.scale).astype(np.float64)
+        c = M[:3, 3].astype(np.float64)
+        hull = np.vstack([p.geom.hull for p in o.parts])
+        facets = []
+        for p in o.parts:
+            for f in p.geom.facets:
+                nw = R @ (f["n"] / s)
+                nw /= np.linalg.norm(nw) + 1e-12
+                facets.append({"nw": nw, "cw": R @ (f["c"] * s) + c, "n": f["n"], "c": f["c"]})
+        return {"c": c, "R": R, "s": s, "hull": (R @ (hull * s).T).T + c, "hull_local": hull, "facets": facets}
+
+    def align_pair(self, m, b, hint=None, center=False):
+        """Re-orient and move `m` so it sits flush, edge-aligned and centred on `b`.
+        Works with any shapes: it finds the face of `b` being touched, lays the flat face of
+        `m` that already points that way onto it, squares up the edges (multiples of 90 deg)
+        and centres it, so hand-placement errors disappear."""
+        gb, gm = self._geom_world(b), self._geom_world(m)
+        cb, cm = gb["c"], gm["c"]
+        d = cm - cb
+        d = np.array([0.0, 1.0, 0.0]) if np.linalg.norm(d) < 1e-6 else d / np.linalg.norm(d)
+        if hint is not None:
+            d = np.asarray(hint, np.float64)
+        fb = None
+        if gb["facets"]:
+            best = max(gb["facets"], key=lambda f: float(f["nw"] @ d))
+            if float(best["nw"] @ d) > 0.45:
+                fb = best
+        n_c = fb["nw"] if fb is not None else d
+
+        R_new, fm = gm["R"], None
+        if gm["facets"]:
+            cand = max(gm["facets"], key=lambda f: float(f["nw"] @ -n_c))
+            if float(cand["nw"] @ -n_c) > 0.2:
+                fm = cand
+        if fm is not None:
+            R_new = rot_between(fm["nw"], -n_c) @ gm["R"]
+            t_b = gb["R"] @ np.array([1.0, 0.0, 0.0])
+            t_b = t_b - n_c * (t_b @ n_c)
+            if np.linalg.norm(t_b) < 0.3:
+                t_b = gb["R"] @ np.array([0.0, 0.0, 1.0])
+                t_b = t_b - n_c * (t_b @ n_c)
+            t_b /= np.linalg.norm(t_b) + 1e-12
+            p = R_new @ np.eye(3)[int(np.argmin(np.abs(fm["n"])))]
+            p = p - n_c * (p @ n_c)
+            if np.linalg.norm(p) > 1e-6:
+                p /= np.linalg.norm(p)
+                ang = math.atan2(float(np.cross(t_b, p) @ n_c), float(t_b @ p))
+                corr = ang - round(ang / (math.pi / 2)) * (math.pi / 2)
+                R_new = axis_angle(n_c, -corr)[:3, :3].astype(np.float64) @ R_new
+
+        s = gm["s"]
+        if fb is not None:
+            s_b = float((fb["cw"] - cb) @ n_c)
+            t_ref = (fb["cw"] - cb) - n_c * s_b
+        else:
+            s_b = float(np.max((gb["hull"] - cb) @ n_c))
+            t_ref = np.zeros(3)
+        rel = cm - cb
+        t_user = rel - n_c * float(rel @ n_c)
+        t_target = t_ref
+        if fb is not None and not center:
+            off = t_user - t_ref
+            if np.linalg.norm(off) > 1e-6:
+                half = float(np.max((gb["hull"] - fb["cw"]) @ (off / np.linalg.norm(off))))
+                if np.linalg.norm(off) > ALIGN_CENTER_FRAC * max(half, 1e-3):
+                    t_target = t_user                      # you meant it off-centre: keep it
+        q = cb + n_c * s_b + t_target
+        if fm is not None:
+            new_c = q - R_new @ (fm["c"] * s)
+        else:
+            hm = (R_new @ (gm["hull_local"] * s).T).T
+            new_c = q + n_c * float(np.max(hm @ -n_c))
+
+        m.R0 = np.eye(4, dtype=np.float32)
+        m.R0[:3, :3] = R_new
+        m.ax = m.ay = 0.0
+        x, y = self.r.project(*new_c)
+        m.x = m.tx = clamp(x, 0, W)
+        m.y = m.ty = clamp(y, 0, H)
+        m.z = m.tz = clamp(float(new_c[2]), Z_MIN, Z_MAX)
+        return {"moved": float(np.linalg.norm(new_c - cm)), "flat": fm is not None}
+
+    def merge_pair(self, a, b, hint=None, center=False, roles=None):
+        moving, base = roles if roles else self.pick_roles(a, b)
+        info = None
+        if self.auto_align and not self._nested(moving, base):
+            info = self.align_pair(moving, base, hint, center)
+        return self.merge_objects(base, moving), info
+
+    def merge_selected(self, subject=None, target=None, relation=None):
+        a = self.sel
+        if subject:
+            m = [o for o in self.objects if o.kind == subject]
+            if m:
+                a = m[-1]
+        if a is None or len(self.objects) < 2:
+            return "I need at least two shapes to merge."
+        roles = None
+        if target:
+            c = [o for o in self.objects if o.kind == target and o is not a]
+            if not c:
+                return f"I can't find a {target} to merge with."
+            b = min(c, key=lambda o: math.hypot(o.x - a.x, o.y - a.y))
+            roles = (a, b)
+        else:
+            info = self.find_contact(a)
+            b = info["b"] if info else min((o for o in self.objects if o is not a),
+                                           key=lambda o: math.hypot(o.x - a.x, o.y - a.y) + 40 * abs(o.z - a.z))
+        hint = {"on": (0, 1, 0), "under": (0, -1, 0)}.get(relation)
+        self.merge_pair(a, b, hint, True, roles)
+        return None
+
+    def align_selected(self):
+        a = self.sel
+        if a is None or len(self.objects) < 2:
+            return "I need two shapes to align."
+        info = self.find_contact(a)
+        b = info["b"] if info else min((o for o in self.objects if o is not a),
+                                       key=lambda o: math.hypot(o.x - a.x, o.y - a.y) + 40 * abs(o.z - a.z))
+        moving, base = self.pick_roles(a, b)
+        self.align_pair(moving, base, None, True)
+        self.toast("ALIGNED")
+        return None
+
+    def merge_objects(self, a, b):
+        """Fuse two shapes into one object that keeps every part."""
+        data = []
+        for o in (a, b):
+            M = o.model_matrix(self.r)
+            for p in o.parts:
+                m = p.geom.mesh.copy()
+                m.apply_transform(M @ o.part_transform(p))       # bake the current pose
+                data.append((m, p.face_colors(), p.geom.flags, p.name))
+        allv = np.vstack([m.vertices for m, *_ in data])
+        lo, hi = allv.min(0), allv.max(0)
+        center, ext = (lo + hi) / 2, float((hi - lo).max())
+        parts = []
+        for m, cols, fl, name in data:
+            m.apply_translation(-center)
+            m.apply_scale(1.0 / ext)
+            parts.append(Part(Geometry(self.r, m, cols, fl), name, "cyan", False))
+        x, y = self.r.project(*center)
+        merged = SceneObject(parts, "merged", self._name("Merged"), clamp(x, 0, W), clamp(y, 0, H),
+                             clamp(float(center[2]), Z_MIN, Z_MAX), scale=ext)
+        merged.ax = merged.ay = 0.0
+        merged.style = a.style
+        old = a.parts + b.parts
+        for o in (a, b):
+            self.objects.remove(o)
+        self._free_parts(old)
+        self.objects.append(merged)
+        self.select(merged)
+        self.held, self.mode = None, None
+        return merged
+
+    def split_selected(self):
+        o = self.sel
+        if o is None or o.kind != "merged" or len(o.parts) < 2:
+            return "Only merged shapes can be split."
+        M = o.model_matrix(self.r)
+        new = []
+        for p in o.parts:
+            m = p.geom.mesh.copy()
+            m.apply_transform(M @ o.part_transform(p))
+            lo, hi = m.bounds
+            center, ext = (lo + hi) / 2, float((hi - lo).max())
+            m.apply_translation(-center)
+            m.apply_scale(1.0 / max(ext, 1e-6))
+            geom = Geometry(self.r, m, p.face_colors(), p.geom.flags)
+            base = p.name.rsplit(" ", 1)[0].lower()
+            kind = base if base in PRIMS else "model"
+            x, y = self.r.project(*center)
+            po = Part(geom, p.name, p.color_name, p.override)
+            po.override, po.color_name = p.override, p.color_name
+            n = SceneObject([po], kind, p.name, clamp(x, 0, W), clamp(y, 0, H),
+                            clamp(float(center[2]), Z_MIN, Z_MAX), scale=max(ext, 0.1))
+            n.ax = n.ay = 0.0
+            n.style = o.style
+            new.append(n)
+        self.objects.remove(o)
+        self._free_parts(o.parts)
+        self.objects.extend(new)
+        self.select(new[-1])
+        return None
+
+    def _moved(self, o):
+        s = self.drag_start
+        if not s:
+            return False
+        return (math.hypot(o.tx - s[0], o.ty - s[1]) > DRAG_MIN_PX or abs(o.tz - s[2]) > 0.2
+                or abs(o.scale / s[3] - 1) > 0.08)
+
+    def _on_drop(self, a):
+        """Let go of a shape touching another: self-align it and merge."""
+        info = self.find_contact(a)
+        if not info:
+            return
+        _, ainfo = self.merge_pair(a, info["b"])
+        self.toast("ALIGNED + MERGED" if ainfo else "MERGED")
+        self.speak("Aligned and merged." if ainfo else "Merged.")
+
+    # -- engine, scanning, design extras ----------------------------------------------
+    def add_engine(self):
+        data, lo, hi, rad = build_engine_parts()
+        parts = [Part(Geometry(self.r, mesh, cols, edge_flags(mesh, 25)), name, "cyan", False)
+                 for name, mesh, cols in data]
+        i = self.spawn_i
+        self.spawn_i += 1
+        o = SceneObject(parts, "engine", self._name("Engine"), W * (0.42 + 0.05 * (i % 4)), H * 0.5, scale=1.9)
+        o.ax, o.ay = 0.15, -0.55
+        o.engine = Engine((lo, hi), [1, 0, 0], 1, rad)
+        rotor = [p for p in parts if p.name.startswith("Fan_Blade") or p.name == "Spinner"]
+        gp = np.vstack([p.geom.mesh.vertices for p in rotor])
+        sp = Spinner((gp.min(0) + gp.max(0)) / 2, [1, 0, 0], 0.0)
+        sp.on, sp.engine_driven = False, True
+        for p in rotor:
+            p.spinner = sp
+        self.objects.append(o)
+        self.select(o)
+        return o
+
+    def make_engine(self, o):
+        """Turn any object into an engine: find the rotor, the axis and the exhaust end."""
+        pts = np.vstack([p.geom.hull for p in o.parts])
+        rotor = match_parts(o, ["blade"]) if len(o.parts) > 1 else []
+        if rotor:
+            group = [o.parts[i] for i in rotor]
+            axis = auto_axis(np.vstack([p.geom.mesh.vertices for p in group]))
+        else:
+            w, v = np.linalg.eigh(np.cov((pts - pts.mean(0)).T))
+            axis = v[:, 2]
+        axis = unit(axis)
+        proj = pts @ axis
+        lo, hi = float(proj.min()), float(proj.max())
+        length = max(hi - lo, 1e-6)
+
+        def radius_at(sel):
+            q = pts[sel]
+            return float(np.linalg.norm(q - np.outer(q @ axis, axis), axis=1).mean()) if len(q) else 0.0
+        r_hi, r_lo = radius_at(proj > hi - 0.2 * length), radius_at(proj < lo + 0.2 * length)
+        line = pts.mean(0) - axis * float(pts.mean(0) @ axis)
+        e = Engine((line + axis * lo, line + axis * hi), axis, 1 if r_hi <= r_lo else -1,
+                   max(0.03, 0.6 * min(r_hi, r_lo)))
+        if rotor:
+            gp = np.vstack([p.geom.mesh.vertices for p in group])
+            sp = Spinner((gp.min(0) + gp.max(0)) / 2, axis, 0.0)
+            sp.on, sp.engine_driven = False, True
+            for p in group:
+                p.spinner = sp
+        o.engine = e
+        return e
+
+    def engine_command(self, k, a):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        e = o.engine or self.make_engine(o)
+        if k == "engine_flip":
+            e.sign = -e.sign
+            self.toast("EXHAUST FLIPPED")
+        elif k == "engine":
+            e.on = a["on"]
+            if e.on and e.thrust < 0.05:
+                e.thrust = 0.5
+            self.toast("ENGINE " + ("ON" if e.on else "OFF"))
+        else:
+            pct, delta = a.get("pct"), a.get("delta") or 0.0
+            e.thrust = clamp(pct / 100.0 if pct is not None else e.thrust + delta, 0.0, 1.0)
+            self.toast(f"THRUST {int(round(e.thrust * 100))}%")
+            if not e.on:
+                self.speak(f"Thrust is set to {int(round(e.thrust * 100))} percent. The engine is off. "
+                           "Say start the engine.")
+        return None
+
+    def _update_engine(self, o, dt):
+        e = o.engine
+        e.rpm += ((e.thrust if e.on else 0.0) - e.rpm) * (1.0 - math.exp(-dt * 1.6))
+        for s in o.spinners():
+            if s.engine_driven:
+                s.on = e.rpm > 0.01
+                s.speed = math.copysign(2.0 + 26.0 * e.rpm, s.speed if s.speed else 1.0)
+        if e.rpm < 0.02:
+            return
+        e.acc += (30.0 + 520.0 * e.rpm) * dt
+        k = int(e.acc)
+        e.acc -= k
+        if k <= 0:
+            return
+        origin = (o.model_matrix(self.r) @ np.append(e.nozzle, 1.0).astype(np.float32))[:3]
+        sc = o.scale
+        self.particles.emit(origin, o.rot4()[:3, :3] @ e.direction, k, (0.9 + 3.6 * e.rpm) * sc,
+                            0.10 + 0.12 * e.rpm, 0.45 + 0.9 * e.rpm, 0.11 * sc * (0.8 + 0.5 * e.rpm),
+                            e.radius * sc)
+
+    def add_scanned(self, mesh, colors):
+        geom = Geometry(self.r, mesh, colors, np.zeros((len(mesh.faces), 3), np.float32))
+        o = SceneObject([Part(geom, "Scan", "cyan", False)], "scan", self._name("Scan"),
+                        W * 0.5, H * 0.5, scale=1.8)
+        o.ax, o.ay = 0.15, 0.4
+        self.objects.append(o)
+        self.select(o)
+        return o
+
+    def smooth_selected(self):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        for p in o.parts:
+            old = p.geom
+            p.geom = Geometry(self.r, smooth_mesh(old.mesh), old.face_colors, old.flags)
+            self._free_geom(old)
+        o.refresh_bounds()
+        self.toast("SMOOTHED")
+        return None
+
+    def restore_colors(self):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        for p in o.parts:
+            p.override = False
+        self.toast("ORIGINAL COLOURS")
+        return None
+
+    # -- parts: select, list, animate ----------------------------------------------
+    def select_part(self, a):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        n = len(o.parts)
+        if a.get("which") == "none":
+            o.focus = None
+            self.toast("WHOLE SHAPE SELECTED")
+            return None
+        if a.get("index"):
+            i = a["index"] - 1
+            if not 0 <= i < n:
+                return f"There is no part {a['index']}."
+            o.focus = i
+        elif a.get("query"):
+            idx = match_parts(o, a["query"])
+            if not idx:
+                other = self.find_object(a["query"])
+                if other:
+                    self.select(other)
+                    return None
+                return f"I couldn't find a part called {' '.join(a['query'])}."
+            o.focus = idx[0]
+        elif a.get("which") in ("next", "prev"):
+            step = 1 if a["which"] == "next" else -1
+            o.focus = (0 if step > 0 else n - 1) if o.focus is None else (o.focus + step) % n
+        self.toast(f"PART {o.focus + 1}: {o.parts[o.focus].name.upper()}")
+        self.speak(f"Part {o.focus + 1}, {o.parts[o.focus].name}.")
+        return None
+
+    def list_parts(self):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        names = [p.name for p in o.parts]
+        if len(names) == 1:
+            return "This shape is a single part."
+        extra = "" if len(names) <= 5 else f", and {len(names) - 5} more"
+        self.speak(f"This shape has {len(names)} parts: " + ", ".join(names[:5]) + extra + ".")
+        return None
+
+    def spin_parts(self, a):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        query, idxs = a.get("query") or [], None
+        if a.get("index"):
+            i = a["index"] - 1
+            if not 0 <= i < len(o.parts):
+                return f"There is no part {a['index']}."
+            idxs = [i]
+        elif query:
+            idxs = match_parts(o, query)
+            if not idxs:
+                other = self.find_object(query)
+                if other:                                        # "spin the sphere" = whole shape
+                    self.select(other)
+                    other.spin = a["on"] is not False
+                    return None
+                return f"I couldn't find parts called {' '.join(query)}. Say list the parts."
+        elif o.focus is not None:
+            idxs = [o.focus]
+        else:
+            running = [s for s in o.spinners() if s.on]
+            for s in running:
+                s.speed *= a.get("factor") or 1.0
+                s.speed = -s.speed if a.get("reverse") else s.speed
+            if not running:
+                if a.get("factor"):
+                    o.spin_speed *= a["factor"]
+                    return None
+                return "Tell me which part, for example: spin the blades."
+            return None
+
+        group = [o.parts[i] for i in idxs]
+        if a.get("on") is False:
+            for p in group:
+                if p.spinner:
+                    p.spinner.on = False
+            return None
+        shared = group[0].spinner
+        if shared is None or any(p.spinner is not shared for p in group) or a.get("axis"):
+            pts = np.vstack([p.geom.mesh.vertices for p in group])
+            pivot = (pts.min(0) + pts.max(0)) / 2
+            axis = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}.get(a.get("axis")) \
+                if a.get("axis") else auto_axis(pts)
+            shared = Spinner(pivot, axis)
+            for p in group:
+                p.spinner = shared
+        shared.on = True
+        if a.get("factor"):
+            shared.speed *= a["factor"]
+        if a.get("reverse"):
+            shared.speed = -shared.speed
+        self.toast(f"SPINNING {len(group)} PART{'S' if len(group) > 1 else ''}", 2)
+        return None
+
+    # -- command execution ---------------------------------------------------------
+    def execute(self, cmd):
+        """Run one parsed command. Returns an error sentence (spoken) or None."""
+        k, a = cmd.kind, cmd.args
+        if k == "add":
+            for _ in range(a.get("count", 1)):
+                self.add_shape(a["shape"], a.get("color"))
+            self.toast(f"ADDED {a['shape'].upper()}")
+            return None
+        if k == "load":
+            self.request_file_dialog()
+            return None
+        if k == "load_path":
+            try:
+                obj = self.load_model(a["path"])
+                self.toast(f"LOADED {obj.name.upper()} ({len(obj.parts)} PARTS)")
+                self.speak(f"Loaded {obj.name}. It has {len(obj.parts)} parts.")
+            except Exception as exc:
+                self.toast("LOAD FAILED: " + str(exc)[:60], 5)
+                self.speak("Sorry, I could not load that file.")
+            return None
+        if k == "clear":
+            self.clear_all()
+            self.toast("WORKSPACE CLEARED")
+            return None
+        if k == "automerge":
+            self.auto_merge = a["on"]
+            self.toast("AUTO-MERGE " + ("ON" if self.auto_merge else "OFF"))
+            return None
+        if k == "merge":
+            err = self.merge_selected(a.get("subject"), a.get("target"), a.get("relation"))
+            self.toast(err or "MERGED")
+            return err
+        if k == "split":
+            err = self.split_selected()
+            self.toast(err or "SPLIT")
+            return err
+        if k == "save":
+            return self.export_selected()
+        if k == "select":
+            return self.select_by(a.get("which"))
+        if k == "place":
+            return self.do_place(a)
+        subj = a.get("subject")
+        if subj and k in SUBJECT_KINDS:
+            match = [x for x in self.objects if x.kind == subj]
+            if match:
+                self.select(match[-1])
+        o = self.sel
+        if k in ("scan", "scan_capture", "scan_finish", "scan_cancel"):
+            sc = self.scanner
+            if sc is None:
+                return "Scanning is not available."
+            return {"scan": sc.start, "scan_capture": sc.capture_now,
+                    "scan_finish": sc.finish, "scan_cancel": sc.cancel}[k]()
+        if k in ("web_search", "web_pick", "web_close"):
+            if self.web is None:
+                return "Online search is not available."
+            if k == "web_search":
+                return self.web.search(a["query"])
+            if k == "web_pick":
+                return self.web.pick(a["index"], a.get("action"))
+            self.web.visible = False
+            return None
+        if k in ("engine", "engine_thrust", "engine_flip"):
+            return self.engine_command(k, a)
+        if k == "align":
+            return self.align_selected()
+        if k == "autoalign":
+            self.auto_align = a["on"]
+            self.toast("AUTO-ALIGN " + ("ON" if self.auto_align else "OFF"))
+            return None
+        if k == "smooth":
+            return self.smooth_selected()
+        if k == "restore_colors":
+            return self.restore_colors()
+        if k == "delete":
+            err = self.delete_selected()
+            self.toast(err or "DELETED")
+            return err
+        if k == "duplicate":
+            err = self.duplicate()
+            self.toast(err or "DUPLICATED")
+            return err
+        if k == "list_parts":
+            return self.list_parts()
+        if o is None:
+            return "There is nothing selected."
+        if k == "select_part":
+            return self.select_part(a)
+        if k == "spin_parts":
+            return self.spin_parts(a)
+        if k == "color":
+            idxs = match_parts(o, a["query"]) if a.get("query") else []
+            targets = [o.parts[i] for i in idxs] if idxs else \
+                ([o.parts[o.focus]] if o.focus is not None else o.parts)
+            for p in targets:
+                p.color_name, p.override = a["color"], True
+        elif k == "style":
+            o.style = a["style"]
+        elif k == "scale":
+            o.scale = clamp(o.scale * a["factor"], MIN_SCALE, MAX_SCALE)
+        elif k == "stretch":
+            for ax in ([1] if a["axis"] == "y" else [0, 2]):
+                o.stretch[ax] = clamp(o.stretch[ax] * a["factor"], 0.3, 4.0)
+        elif k == "spin":
+            o.spin = a["on"]
+            if not a["on"]:
+                for s in o.spinners():
+                    s.on = False
+        elif k == "move":
+            if a["axis"] == "z":
+                o.tz = clamp(o.tz + a["amount"], Z_MIN, Z_MAX)
+            elif a["axis"] == "x":
+                o.tx = clamp(o.tx + a["amount"] * self.r.px_per_world(o.z), 0, W)
+            else:
+                o.ty = clamp(o.ty - a["amount"] * self.r.px_per_world(o.z), 0, H)
+        elif k == "reset":
+            o.ax, o.ay = 0.35, 0.6
+            o.R0 = np.eye(4, dtype=np.float32)
+            o.stretch[:] = 1.0
+        self.toast(k.upper() + " OK", 1.5)
+        return None
+
+    def do_place(self, a):
+        subj = None
+        if a.get("subject"):
+            m = [x for x in self.objects if x.kind == a["subject"]]
+            subj = m[-1] if m else None
+        subj = subj or self.sel
+        if subj is None:
+            return "There is nothing selected."
+        cands = [x for x in self.objects if x.kind == a["target"] and x is not subj]
+        if not cands:
+            return f"I can't find a {a['target']} to use."
+        target = min(cands, key=lambda x: math.hypot(x.x - subj.x, x.y - subj.y))
+        rel = a["relation"]
+        hints = {"on": (0, 1, 0), "under": (0, -1, 0), "left": (-1, 0, 0), "right": (1, 0, 0),
+                 "front": (0, 0, 1), "behind": (0, 0, -1)}
+        if rel != "inside" and self.auto_align:
+            self.align_pair(subj, target, hints[rel], True)       # flush, squared up and centred
+        else:
+            self.place_relative(subj, target, rel)
+        self.select(subj)
+        if a["relation"] == "inside" and target.style == "solid":
+            target.style = "holo"
+            self.speak("I made the outer shape a hologram so you can see inside.")
+        self.toast(f"PLACED {REL_TEXT[a['relation']].upper()} {target.name.upper()}")
+        return None
+
+    def select_by(self, which):
+        if not self.objects:
+            return "There is nothing to select."
+        idx = self.objects.index(self.sel) if self.sel in self.objects else -1
+        if which == "next":
+            self.select(self.objects[(idx + 1) % len(self.objects)])
+        elif which == "prev":
+            self.select(self.objects[(idx - 1) % len(self.objects)])
+        else:
+            m = [o for o in self.objects if o.kind == which]
+            if not m:
+                return f"I can't find a {which}."
+            self.select(m[-1])
+        return None
+
+    def cycle_color(self):
+        o = self.sel
+        if o:
+            targets = [o.parts[o.focus]] if o.focus is not None else o.parts
+            i = COLOR_CYCLE.index(targets[0].color_name)
+            for p in targets:
+                p.color_name, p.override = COLOR_CYCLE[(i + 1) % len(COLOR_CYCLE)], True
+
+    def cycle_style(self):
+        if self.sel:
+            self.sel.style = STYLE_CYCLE[(STYLE_CYCLE.index(self.sel.style) + 1) % 3]
+
+    def toggle_focus_spin(self):
+        o = self.sel
+        if o is None or o.focus is None:
+            self.toast("SELECT A PART FIRST (P)")
+            return
+        p = o.parts[o.focus]
+        if p.spinner is not None and p.spinner.on:
+            p.spinner.on = False
+        else:
+            self.spin_parts({"index": o.focus + 1, "on": True})
+
+    def export_selected(self):
+        o = self.sel
+        if o is None:
+            return "There is nothing selected."
+        M = o.rot4() @ scale_m(*(o.stretch * o.scale))
+        metas = []
+        for p in o.parts:
+            m = p.geom.mesh.copy()
+            m.apply_transform(M @ o.part_transform(p))
+            metas.append((m, p.face_colors()))
+        mesh = trimesh.util.concatenate([m for m, _ in metas])
+        rgba = np.full((len(mesh.faces), 4), 255, np.uint8)
+        rgba[:, :3] = (np.vstack([c for _, c in metas]) * 255).astype(np.uint8)
+        out = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, face_colors=rgba, process=False)
+        folder = os.path.join(BASE_DIR, "sara_exports")
+        os.makedirs(folder, exist_ok=True)
+        stem = os.path.join(folder, f"{o.name.replace(' ', '_')}_{int(time.time())}")
+        out.export(stem + ".stl")
+        out.export(stem + ".ply")
+        self.toast("SAVED TO sara_exports/", 4)
+        return None
+
+    # -- gestures ------------------------------------------------------------------
+    def pick(self, pt):
+        """Smallest shape under the pinch wins, so small shapes inside big ones stay reachable."""
+        best, best_r = None, 1e9
+        for o in self.objects:
+            rr = o.radius_px(self.r) * 1.1
+            if math.hypot(o.x - pt[0], o.y - pt[1]) <= rr and rr < best_r:
+                best, best_r = o, rr
+        return best
+
+    def _grab(self, target, pt, size):
+        self.held, target.held, self.mode = target, True, "move"
+        self.grab_off = (target.x - pt[0], target.y - pt[1])
+        self.grab_size, self.grab_z = max(size, 1.0), target.tz
+        self.drag_start = (target.tx, target.ty, target.tz, target.scale)
+        self.select(target)
+
+    def _release(self):
+        held, mode = self.held, self.mode
+        if held:
+            held.held = False
+        self.held, self.mode, self.rot_last = None, None, None
+        if held and mode in ("move", "resize") and held in self.objects and self.auto_merge \
+                and self._moved(held):
+            self._on_drop(held)
+        self.drag_start = None
+
+    def handle_gestures(self, pinches):
+        """pinches: list of (x, y, hand_size) for hands that are pinching."""
+        n = len(pinches)
+        if n >= 2:
+            (ax, ay, _), (bx, by, _) = pinches[0], pinches[1]
+            mid, dist = ((ax + bx) / 2, (ay + by) / 2), math.hypot(bx - ax, by - ay)
+            if self.mode != "resize":
+                target = self.held or self.pick(mid) or self.sel
+                if target is None:
+                    return
+                if self.held and self.held is not target:
+                    self.held.held = False
+                if self.drag_start is None:
+                    self.drag_start = (target.tx, target.ty, target.tz, target.scale)
+                self.held, target.held, self.mode = target, True, "resize"
+                self.r_dist0, self.r_scale0 = max(dist, 1.0), target.scale
+                self.select(target)
+            t = self.held
+            t.scale = clamp(self.r_scale0 * dist / self.r_dist0, MIN_SCALE, MAX_SCALE)
+            t.tx, t.ty = mid
+        elif n == 1:
+            x, y, size = pinches[0]
+            pt = (x, y)
+            if self.mode == "resize":
+                self.mode = "move"
+                self.grab_off = (self.held.x - x, self.held.y - y)
+                self.grab_size, self.grab_z = max(size, 1.0), self.held.tz
+            elif self.mode is None:
+                target = self.pick(pt)
+                if target:
+                    self._grab(target, pt, size)
+                elif self.sel:
+                    self.mode, self.rot_last = "rotate", pt
+            elif self.mode == "move":
+                h = self.held
+                h.tx, h.ty = x + self.grab_off[0], y + self.grab_off[1]
+                if HAND_DEPTH:
+                    d = size / self.grab_size - 1.0
+                    if abs(d) > DEPTH_DEADZONE:
+                        d = (abs(d) - DEPTH_DEADZONE) * (1 if d > 0 else -1) * DEPTH_GAIN
+                        h.tz = clamp(self.grab_z + d, Z_MIN, Z_MAX)
+                    else:
+                        h.tz = self.grab_z
+            elif self.mode == "rotate" and self.sel and self.rot_last:
+                self.sel.ay += (x - self.rot_last[0]) * 0.012
+                self.sel.ax += (y - self.rot_last[1]) * 0.012
+                self.rot_last = pt
+        else:
+            self._release()
+
+    def update(self, dt):
+        k = 1.0 - math.exp(-dt * 22.0)
+        for o in self.objects:
+            o.x += (o.tx - o.x) * k
+            o.y += (o.ty - o.y) * k
+            o.z += (o.tz - o.z) * k
+            o.x, o.y = clamp(o.x, 0, W), clamp(o.y, 0, H)
+            if o.spin and not o.held:
+                o.ay += dt * o.spin_speed
+            if o.engine:
+                self._update_engine(o, dt)
+            for s in o.spinners():
+                s.advance(dt)
+        self.particles.update(dt)
+        cand = None
+        if self.held and self.auto_merge and self.held in self.objects:
+            info = self.find_contact(self.held)
+            cand = info["b"] if info else None
+        self.merge_candidate = cand
+
+
+# ---------------------------------------------------------------------------
+# Voice output: human-like female voice with fallbacks
+# ---------------------------------------------------------------------------
+class Speaker:
+    """
+    Speaks in its own thread. Order of preference:
+      1. Neural female voice via edge-tts (natural sounding, needs internet)
+      2. Windows built-in voice (no install), macOS 'say', or pyttsx3
+    Replies are cached, so repeated phrases play instantly.
+    """
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self.busy = False
+        self.mute_until = 0.0
+        self.error = ""
+        self.used = ""
+        self.neural_retry_at = 0.0
+        self.cache_dir = os.path.join(tempfile.gettempdir(), "sara_voice_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        if HAS_EDGE:
+            self.mode = "NEURAL"
+        elif os.name == "nt":
+            self.mode = "WINDOWS"
+        elif sys.platform == "darwin":
+            self.mode = "MAC"
+        elif HAS_TTS:
+            self.mode = "PYTTSX3"
+        else:
+            self.mode = "NONE"
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def label(self):
+        if self.mode == "NONE":
+            return "NONE - pip install edge-tts"
+        base = f"{self.used or self.mode}"
+        if self.mode == "NEURAL" and not self.used:
+            base = f"NEURAL ({VOICE_NAME})"
+        return base + (f"  [{self.error}]" if self.error else "")
+
+    def say(self, text):
+        if self.mode == "NONE" or not text:
+            return
+        while self.q.qsize() > 2:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+        self.q.put(text)
+
+    def _worker(self):
+        while True:
+            text = self.q.get()
+            self.busy = True
+            ok = False
+            try:
+                if self.mode == "NEURAL" and time.time() >= self.neural_retry_at:
+                    ok = self._say_neural(text)
+                    if ok:
+                        self.used = f"NEURAL {VOICE_NAME}"
+                    else:
+                        self.neural_retry_at = time.time() + 30       # don't wait on a dead network
+                if not ok:
+                    ok = self._say_offline(text)
+                    if ok:
+                        self.used = "BUILT-IN VOICE"
+            except Exception as exc:
+                self.error = f"{type(exc).__name__}: {exc}"[:70]
+            self.busy = False
+            self.mute_until = time.time() + 0.5
+
+    # -- neural voice ------------------------------------------------------------
+    async def _synth(self, text, path):
+        await edge_tts.Communicate(text, VOICE_NAME, rate=VOICE_RATE, pitch=VOICE_PITCH).save(path)
+
+    def _say_neural(self, text):
+        try:
+            key = hashlib.sha1(f"{VOICE_NAME}|{VOICE_RATE}|{VOICE_PITCH}|{text}".encode()).hexdigest()[:20]
+            path = os.path.join(self.cache_dir, key + ".mp3")
+            if not os.path.exists(path):
+                tmp = path + ".part"
+                asyncio.run(self._synth(text, tmp))
+                os.replace(tmp, path)
+            self._play_file(path)
+            self.error = ""
+            return True
+        except Exception as exc:
+            self.error = f"neural: {type(exc).__name__}"[:40]
+            return False
+
+    def _play_file(self, path):
+        if os.name == "nt":
+            import ctypes
+            winmm = ctypes.windll.winmm
+
+            def mci(cmd):
+                buf = ctypes.create_unicode_buffer(256)
+                err = winmm.mciSendStringW(cmd, buf, 255, 0)
+                if err:
+                    eb = ctypes.create_unicode_buffer(256)
+                    winmm.mciGetErrorStringW(err, eb, 255)
+                    raise RuntimeError("MCI " + eb.value)
+            mci(f'open "{path}" type mpegvideo alias saravoice')
+            try:
+                mci("play saravoice wait")
+            finally:
+                mci("close saravoice")
+            return
+        for cmd in (["afplay", path], ["mpg123", "-q", path], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]):
+            if shutil.which(cmd[0]):
+                subprocess.run(cmd, check=True, timeout=60)
+                return
+        raise RuntimeError("no mp3 player found")
+
+    # -- offline fallbacks -------------------------------------------------------
+    def _say_offline(self, text):
+        try:
+            if os.name == "nt":
+                script = ("Add-Type -AssemblyName System.Speech;"
+                          "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+                          "try { $s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::Female) } catch {};"
+                          "$s.Rate = 0; $s.Speak($env:SARA_TEXT)")
+                subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                               env=dict(os.environ, SARA_TEXT=text), timeout=40, check=True,
+                               capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                return True
+            if sys.platform == "darwin":
+                subprocess.run(["say", "-v", "Samantha", text], timeout=40, check=True)
+                return True
+            if HAS_TTS:
+                engine = pyttsx3.init()
+                voices = engine.getProperty("voices")
+                for v in voices:
+                    if any(k in v.name.lower() for k in ("zira", "female", "hazel", "susan", "samantha")):
+                        engine.setProperty("voice", v.id)
+                        break
+                engine.say(text)
+                engine.runAndWait()
+                engine.stop()
+                return True
+        except Exception as exc:
+            self.error = f"offline: {type(exc).__name__}"[:40]
+        return False
+
+
+class VoiceAssistant:
+    def __init__(self, cmd_queue):
+        self.cmd_queue = cmd_queue
+        self.speaker = Speaker()
+        self.awake_until = 0.0
+        self.heard = self.reply = ""
+        self.status = "MIC OFFLINE - pip install SpeechRecognition pyaudio" if not HAS_SR else "STARTING MIC..."
+        if HAS_SR:
+            threading.Thread(target=self._listen_loop, daemon=True).start()
+
+    @property
+    def awake(self):
+        return time.time() < self.awake_until
+
+    @property
+    def is_speaking(self):
+        return self.speaker.busy
+
+    def speak(self, text):
+        self.reply = text
+        self.speaker.say(text)
+
+    def submit(self, text, require_wake):
+        """Handle a spoken or typed sentence."""
+        found, rest = strip_wake_word(text)
+        if require_wake and not found and not self.awake:
+            return
+        if found and not rest:
+            self.awake_until = time.time() + WAKE_WINDOW
+            self.speak("Yes, I'm listening.")
+            return
+        self.awake_until = 0.0
+        cmds = parse_commands(text)
+        if not cmds:
+            self.speak("Sorry, I didn't understand that.")
+            return
+        self.speak(acknowledgement(cmds))
+        for c in cmds:
+            self.cmd_queue.put(c)
+
+    def _listen_loop(self):
+        rec = sr.Recognizer()
+        rec.dynamic_energy_threshold = True
+        rec.pause_threshold = 0.7
+        try:
+            mic = sr.Microphone()
+            with mic as source:
+                rec.adjust_for_ambient_noise(source, duration=0.8)
+        except Exception:
+            self.status = "MIC UNAVAILABLE"
+            return
+        self.status = "SAY 'SARA' TO WAKE"
+        while True:
+            if self.speaker.busy or time.time() < self.speaker.mute_until:
+                time.sleep(0.1)
+                continue
+            try:
+                with mic as source:
+                    audio = rec.listen(source, timeout=3, phrase_time_limit=6)
+                text = rec.recognize_google(audio, language=STT_LANGUAGE)
+            except (sr.WaitTimeoutError, sr.UnknownValueError):
+                continue
+            except sr.RequestError:
+                self.status = "SPEECH SERVICE NEEDS INTERNET"
+                time.sleep(2)
+                continue
+            except Exception:
+                time.sleep(0.5)
+                continue
+            self.status = "SAY 'SARA' TO WAKE"
+            self.heard = text.lower()
+            self.submit(text, require_wake=True)
+
+
+def open_file_dialog(cmd_queue, state):
+    """Native file picker in its own thread; the chosen path is queued as a command."""
+    if state.get("open"):
+        return
+    state["open"] = True
+
+    def run():
+        path = ""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                parent=root, title="Load a 3D model",
+                filetypes=[("3D models", "*.stl *.obj *.ply *.glb *.gltf *.off *.3mf"), ("All files", "*.*")])
+            root.destroy()
+        except Exception:
+            pass
+        state["open"] = False
+        if path:
+            cmd_queue.put(Command("load_path", {"path": path}))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Camera + hand tracking
+# ---------------------------------------------------------------------------
+def ensure_model():
+    if os.path.exists(MODEL_PATH):
+        return
+    print("Downloading hand landmark model (one time only)...")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    except Exception as error:
+        if os.path.exists(MODEL_PATH):
+            os.remove(MODEL_PATH)
+        raise RuntimeError(f"Could not download the model: {error}\nDownload {MODEL_URL}\nand save it as {MODEL_PATH}")
+
+
+def open_camera():
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open the camera. Close other apps using it.")
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def fit_frame(img):
+    h, w = img.shape[:2]
+    target = W / H
+    if w / h > target + 1e-3:
+        nw = int(h * target)
+        x0 = (w - nw) // 2
+        img = img[:, x0:x0 + nw]
+    elif w / h < target - 1e-3:
+        nh = int(w / target)
+        y0 = (h - nh) // 2
+        img = img[y0:y0 + nh]
+    if img.shape[1] != W or img.shape[0] != H:
+        img = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+    return img
+
+
+class HandTracker(threading.Thread):
+    """Camera + MediaPipe in a background thread so rendering stays smooth."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.cap = open_camera()
+        self.landmarker = vision.HandLandmarker.create_from_options(
+            vision.HandLandmarkerOptions(
+                base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
+                running_mode=vision.RunningMode.VIDEO, num_hands=2,
+                min_hand_detection_confidence=0.6, min_hand_presence_confidence=0.5,
+                min_tracking_confidence=0.5))
+        self.cond = threading.Condition()
+        self.frame_id, self.frame, self.hands = 0, None, []
+        self.running = True
+
+    def run(self):
+        t0, last_ts = time.monotonic(), -1
+        while self.running:
+            ok, raw = self.cap.read()
+            if not ok:
+                time.sleep(0.01)
+                continue
+            frame = cv2.flip(fit_frame(raw), 1)
+            small = cv2.cvtColor(cv2.resize(frame, (DET_W, DET_H), interpolation=cv2.INTER_AREA),
+                                 cv2.COLOR_BGR2RGB)
+            ts = max(last_ts + 1, int((time.monotonic() - t0) * 1000))
+            last_ts = ts
+            res = self.landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=small), ts)
+            hands = []
+            for i, lms in enumerate(res.hand_landmarks):
+                label = res.handedness[i][0].category_name if res.handedness else str(i)
+                hands.append((label, np.array([(p.x * W, p.y * H) for p in lms], np.float32)))
+            with self.cond:
+                self.frame, self.hands = frame, hands
+                self.frame_id += 1
+                self.cond.notify_all()
+
+    def get(self, last_id, timeout=0.1):
+        with self.cond:
+            self.cond.wait_for(lambda: self.frame_id != last_id or not self.running, timeout)
+            return self.frame_id, self.frame, self.hands
+
+    def stop(self):
+        self.running = False
+        self.join(timeout=2)
+        self.cap.release()
+        self.landmarker.close()
+
+
+class PinchTracker:
+    """Pinch state with hysteresis, smoothing and a smoothed hand size (for depth)."""
+
+    def __init__(self):
+        self.state, self.smooth, self.size = {}, {}, {}
+
+    def update(self, hands):
+        out, used = [], set()
+        for label, pts in hands:
+            key = label + "2" if label in used else label
+            used.add(key)
+            size = float(np.linalg.norm(pts[9] - pts[0])) + 1e-5
+            ratio = float(np.linalg.norm(pts[4] - pts[8])) / size
+            was = self.state.get(key, False)
+            pinching = ratio < (PINCH_OFF if was else PINCH_ON)
+            self.state[key] = pinching
+            mid = (pts[4] + pts[8]) / 2
+            prev = self.smooth.get(key)
+            point = mid if (prev is None or not was) else prev * 0.4 + mid * 0.6
+            self.smooth[key] = point
+            ps = self.size.get(key)
+            self.size[key] = size if (ps is None or not was) else ps * 0.7 + size * 0.3
+            out.append({"key": key, "pts": [(int(x), int(y)) for x, y in pts], "pinching": pinching,
+                        "ratio": ratio, "point": (float(point[0]), float(point[1])), "size": self.size[key]})
+        for k in list(self.state):
+            if k not in used:
+                self.state[k] = False
+        return sorted(out, key=lambda h: h["key"])
+
+
+# ---------------------------------------------------------------------------
+# Engine: thrust, spinning rotor, exhaust particles
+# ---------------------------------------------------------------------------
+class Engine:
+    """State of a running engine attached to an object (axis + exhaust end in local space)."""
+
+    def __init__(self, ends, axis, sign, radius):
+        self.ends = (np.asarray(ends[0], np.float32), np.asarray(ends[1], np.float32))
+        self.axis = unit(axis)
+        self.sign = sign                     # +1: exhaust leaves through the far end
+        self.radius = float(radius)
+        self.on, self.thrust, self.rpm, self.acc = False, 0.6, 0.0, 0.0
+
+    @property
+    def nozzle(self):
+        return self.ends[1] if self.sign > 0 else self.ends[0]
+
+    @property
+    def direction(self):
+        return self.axis * self.sign
+
+
+class ParticleSystem:
+    """CPU-simulated exhaust particles in world space, drawn as glowing GPU points."""
+
+    def __init__(self, n=MAX_PARTICLES):
+        self.pos = np.zeros((n, 3), np.float32)
+        self.vel = np.zeros((n, 3), np.float32)
+        self.age = np.ones(n, np.float32)
+        self.life = np.full(n, 0.5, np.float32)
+        self.size = np.zeros(n, np.float32)
+        self.rng = np.random.default_rng(7)
+
+    def emit(self, origin, direction, k, speed, spread, life, size, radius):
+        free = np.flatnonzero(self.age >= self.life)[:k]
+        k = len(free)
+        if k == 0:
+            return
+        d = unit(direction).astype(np.float64)
+        a = np.cross(d, [0.0, 1.0, 0.0])
+        if np.linalg.norm(a) < 1e-3:
+            a = np.cross(d, [1.0, 0.0, 0.0])
+        a /= np.linalg.norm(a)
+        b = np.cross(d, a)
+        r = self.rng
+        ang = r.uniform(0, 2 * np.pi, k)
+        lateral = np.cos(ang)[:, None] * a + np.sin(ang)[:, None] * b
+        rad = np.sqrt(r.uniform(0, 1, k)) * radius
+        self.pos[free] = origin + lateral * rad[:, None]
+        cone = lateral * (r.uniform(0, 1, k) * spread)[:, None]
+        self.vel[free] = (d + cone) * (speed * r.uniform(0.75, 1.15, k))[:, None]
+        self.age[free] = 0.0
+        self.life[free] = life * r.uniform(0.7, 1.2, k)
+        self.size[free] = size * r.uniform(0.7, 1.3, k)
+
+    def update(self, dt):
+        alive = self.age < self.life
+        n = int(alive.sum())
+        if n == 0:
+            return
+        self.pos[alive] += self.vel[alive] * dt
+        self.vel[alive] *= (1.0 - 0.6 * dt)
+        self.vel[alive] += self.rng.standard_normal((n, 3)).astype(np.float32) * (0.6 * dt)
+        self.age[alive] += dt
+
+    def gpu_array(self):
+        alive = self.age < self.life
+        if not alive.any():
+            return None
+        f = self.age[alive] / self.life[alive]
+        return np.column_stack([self.pos[alive], f, self.size[alive] * (1.0 + 1.5 * f)]).astype(np.float32)
+
+
+def build_engine_parts():
+    """Procedural turbofan with named parts (Nacelle, Core, Spinner, Fan_Blade_n, Nozzle, Tail_Cone).
+    Axis along X, intake on the left, exhaust on the right.
+    Returns (parts [(name, mesh, face_colours)], intake point, exhaust point, exhaust radius)."""
+    c, T = trimesh.creation, trimesh.transformations
+    parts = []
+
+    def add(name, mesh, rgb):
+        parts.append([name, mesh, np.array(rgb, np.float32)])
+
+    def at_z(mesh, z):
+        mesh.apply_translation([0, 0, z])
+        return mesh
+
+    add("Nacelle", c.annulus(r_min=0.50, r_max=0.60, height=1.0, sections=64), (0.62, 0.68, 0.78))
+    add("Core", at_z(c.cylinder(radius=0.27, height=0.62, sections=48), -0.20), (0.30, 0.32, 0.38))
+    nose = at_z(c.cone(radius=0.17, height=0.32, sections=32), 0.42)
+    hub = at_z(c.cylinder(radius=0.17, height=0.14, sections=32), 0.35)
+    add("Spinner", trimesh.util.concatenate([nose, hub]), (0.92, 0.94, 0.98))
+    blades = 14
+    for i in range(blades):
+        blade = c.box(extents=(0.36, 0.11, 0.028))
+        blade.apply_transform(T.rotation_matrix(math.radians(28), [1, 0, 0]))
+        blade.apply_translation([0.35, 0, 0.35])
+        blade.apply_transform(T.rotation_matrix(2 * math.pi * i / blades, [0, 0, 1]))
+        add(f"Fan_Blade_{i + 1}", blade, (0.80, 0.84, 0.90))
+    add("Nozzle", at_z(c.annulus(r_min=0.22, r_max=0.36, height=0.34, sections=48), -0.62), (0.85, 0.52, 0.25))
+    tail = c.cone(radius=0.22, height=0.40, sections=32)
+    tail.apply_transform(T.rotation_matrix(math.pi, [1, 0, 0]))
+    add("Tail_Cone", at_z(tail, -0.50), (0.35, 0.36, 0.42))
+    R = T.rotation_matrix(-math.pi / 2, [0, 1, 0])          # +Z intake -> -X (left)
+    for p in parts:
+        p[1].apply_transform(R)
+    allv = np.vstack([p[1].vertices for p in parts])
+    lo, hi = allv.min(0), allv.max(0)
+    centre, size = (lo + hi) / 2, float((hi - lo).max())
+    out = []
+    for name, mesh, rgb in parts:
+        mesh.apply_translation(-centre)
+        mesh.apply_scale(1.0 / size)
+        out.append((name, mesh, np.tile(rgb, (len(mesh.faces), 1))))
+    lo_x, hi_x = float((lo[0] - centre[0]) / size), float((hi[0] - centre[0]) / size)
+    return out, np.array([lo_x, 0, 0], np.float32), np.array([hi_x, 0, 0], np.float32), 0.30 / size
+
+
+# ---------------------------------------------------------------------------
+# 3D scanning: hold an object in your hand, turn it, get a 3D model
+# ---------------------------------------------------------------------------
+def _roi_px():
+    x0, y0, x1, y1 = SCAN_ROI
+    return int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H)
+
+
+def segment_object(frame, bg, hand_pts):
+    """Binary mask (uint8 0/255, full frame) of the object in the hand.
+    Background subtraction, minus skin (colour learned from your palm), minus wrist and arm."""
+    x0, y0, x1, y1 = _roi_px()
+    f = cv2.GaussianBlur(frame[y0:y1, x0:x1], (5, 5), 0)
+    b = cv2.GaussianBlur(bg[y0:y1, x0:x1], (5, 5), 0)
+    fg = (cv2.absdiff(f, b).max(axis=2) > SCAN_DIFF).astype(np.uint8) * 255
+    out = np.zeros(frame.shape[:2], np.uint8)
+    palm, size = None, 1.0
+    if hand_pts is not None:
+        pts = np.asarray(hand_pts, np.float32)
+        size = float(np.linalg.norm(pts[9] - pts[0])) + 1e-3
+        palm = pts[[0, 5, 9, 13, 17]].mean(0)
+        ycc = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        r = int(max(4, 0.1 * size))
+        samples = []
+        for i in (0, 1, 5, 17):                      # wrist-side palm points
+            px, py = int(pts[i][0]), int(pts[i][1])
+            patch = ycc[max(py - r, 0):py + r, max(px - r, 0):px + r, 1:3].reshape(-1, 2)
+            if len(patch):
+                samples.append(patch)
+        if samples:
+            crcb = np.vstack(samples).astype(np.float32)
+            mu = np.median(crcb, axis=0)
+            sig = np.maximum(1.4826 * np.median(np.abs(crcb - mu), axis=0), 3.0)
+            roi = ycc[y0:y1, x0:x1, 1:3].astype(np.float32)
+            skin = np.all(np.abs(roi - mu) < 3.5 * sig + 4.0, axis=2).astype(np.uint8) * 255
+            skin = cv2.dilate(skin, np.ones((5, 5), np.uint8))
+            fg = cv2.bitwise_and(fg, cv2.bitwise_not(skin))
+        ys, xs = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+        fwd = pts[9] - pts[0]
+        fwd /= np.linalg.norm(fwd) + 1e-6
+        fg[((xs - pts[0][0]) * fwd[0] + (ys - pts[0][1]) * fwd[1]) < -0.15 * size] = 0   # forearm / sleeve
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(fg)
+    best, best_area = 0, 0
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if palm is not None and math.hypot(cent[i][0] + x0 - palm[0], cent[i][1] + y0 - palm[1]) > 3.2 * size:
+            continue
+        if area > best_area:
+            best, best_area = i, area
+    if best == 0 or best_area < 0.01 * fg.size:
+        return out
+    comp = (lab == best).astype(np.uint8) * 255
+    cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(comp)
+    cv2.drawContours(filled, cnts, -1, 255, -1)      # fill holes
+    out[y0:y1, x0:x1] = filled
+    return out
+
+
+def _fill_colors(img, mask):
+    """Push object colours outward so edge pixels never sample the background."""
+    inner = (cv2.erode(mask, np.ones((5, 5), np.uint8)) > 0).astype(np.float32)
+    num = cv2.GaussianBlur(img.astype(np.float32) * inner[..., None], (0, 0), 5)
+    den = cv2.GaussianBlur(inner, (0, 0), 5)
+    filled = num / np.maximum(den, 1e-3)[..., None]
+    return np.where(inner[..., None] > 0, img.astype(np.float32), filled).astype(np.uint8)
+
+
+def build_scan_model(views, grid=SCAN_GRID, turn=1.0):
+    """views: [(mask, image)] captured every 360/N degrees (un-mirrored camera images).
+    One view is inflated into a rounded solid; two or more are carved (visual hull).
+    Returns (normalised mesh, per-face RGB colours)."""
+    try:
+        from scipy import ndimage as ndi
+        from skimage import measure
+    except ImportError:
+        raise RuntimeError("scanning needs: python -m pip install scipy scikit-image")
+    G = grid
+    boxes = []
+    for mask, _ in views:
+        ys, xs = np.nonzero(mask)
+        if len(xs) < 50:
+            raise ValueError("a captured view was empty")
+        boxes.append((xs.min(), xs.max() + 1, ys.min(), ys.max() + 1))
+    s = 0.86 * G / max(max(b[1] - b[0], b[3] - b[2]) for b in boxes)
+    masks, colors = [], []
+    for (mask, img), (bx0, bx1, by0, by1) in zip(views, boxes):
+        M = np.array([[s, 0, G / 2 - s * (bx0 + bx1) / 2], [0, s, G / 2 - s * (by0 + by1) / 2]], np.float32)
+        masks.append(cv2.warpAffine(mask, M, (G, G), flags=cv2.INTER_LINEAR) > 127)
+        colors.append(cv2.warpAffine(_fill_colors(img, mask), M, (G, G), flags=cv2.INTER_LINEAR))
+
+    idx = np.arange(G)
+    X = idx - G / 2 + 0.5
+    rows = G - 1 - idx
+    if len(masks) == 1:
+        angles = [0.0]
+        dt = cv2.distanceTransform(masks[0].astype(np.uint8), cv2.DIST_L2, 5)
+        dmax = max(float(dt.max()), 1.0)
+        thick = 0.6 * dmax * np.sqrt(np.clip(1 - (1 - dt / dmax) ** 2, 0, 1))
+        vol = np.abs(X)[None, None, :] < thick[rows[None, :], idx[:, None]][:, :, None]
+    else:
+        angles = [turn * 2 * math.pi * k / len(masks) for k in range(len(masks))]
+        vol = np.ones((G, G, G), bool)
+        for phi, m in zip(angles, masks):
+            u = np.rint(X[:, None] * math.cos(phi) + X[None, :] * math.sin(phi) + G / 2 - 0.5).astype(int)
+            ok = (u >= 0) & (u < G)
+            vol &= m[rows[None, :, None], np.clip(u, 0, G - 1)[:, None, :]] & ok[:, None, :]
+    if not vol.any():
+        raise ValueError("the views do not overlap; keep the object centred and turn it about its vertical axis")
+    lab, n = ndi.label(vol)
+    if n > 1:
+        vol = lab == 1 + int(np.argmax(ndi.sum(vol, lab, range(1, n + 1))))
+    volf = ndi.gaussian_filter(np.pad(vol.astype(np.float32), 2), 1.0)
+    verts, faces, _, _ = measure.marching_cubes(volf, level=0.5)
+    verts = verts - 2 - G / 2 + 0.5
+    v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+    if float(np.einsum("ij,ij->i", v0, np.cross(v1, v2)).sum()) < 0:
+        faces = faces[:, ::-1]
+    mesh = trimesh.Trimesh(verts, faces, process=False)
+
+    cent, nrm = mesh.triangles_center, mesh.face_normals
+    best = np.zeros(len(faces), int)
+    score = np.full(len(faces), -9.0)
+    for k, phi in enumerate(angles):
+        w = nrm @ np.array([-math.sin(phi), 0.0, math.cos(phi)])
+        better = w > score
+        best[better], score[better] = k, w[better]
+    rgb = np.zeros((len(faces), 3), np.float32)
+    for k, phi in enumerate(angles):
+        sel = best == k
+        if not sel.any():
+            continue
+        c = cent[sel]
+        u = np.clip(np.rint(c[:, 0] * math.cos(phi) + c[:, 2] * math.sin(phi) + G / 2 - 0.5).astype(int), 0, G - 1)
+        v = np.clip(np.rint(G - 1 - (c[:, 1] + G / 2 - 0.5)).astype(int), 0, G - 1)
+        rgb[sel] = colors[k][v, u][:, ::-1] / 255.0
+    return normalized(mesh), rgb
+
+
+class Scanner:
+    """Hold an object in your hand, turn it in front of the camera, get a 3D model."""
+    IDLE, BG, CAPTURE, BUILD = "IDLE", "BACKGROUND", "CAPTURE", "BUILDING"
+
+    def __init__(self, results, say):
+        self.results, self.say = results, say
+        self.state = self.IDLE
+        self.views, self.thumbs = [], []
+        self.mask, self.msg = None, ""
+        self.roi = _roi_px()
+        self._runtime()
+
+    def _runtime(self):
+        self.bg = self.bg_acc = self.frame = None
+        self.bg_n = 0
+        self.stable, self.travel = 0.0, 1e9
+        self.last_c = self.last_area = self.last_palm = self.t_prev = None
+
+    def active(self):
+        return self.state != self.IDLE
+
+    def start(self):
+        if self.state == self.BUILD:
+            return "I'm still building the last scan."
+        self.views, self.thumbs, self.mask = [], [], None
+        self._runtime()
+        self.state, self.msg = self.BG, "Take your hand out of view..."
+        self.say("Scanner ready. Take your hand out of view for a moment.")
+        return None
+
+    def cancel(self):
+        if not self.active():
+            return "There is no scan running."
+        self.state, self.views, self.thumbs, self.mask, self.msg = self.IDLE, [], [], None, ""
+        return None
+
+    def capture_now(self):
+        if self.state != self.CAPTURE:
+            return "Start a scan first."
+        if self.mask is None or not self.mask.any():
+            return "I can't see the object yet."
+        self._store()
+        return None
+
+    def finish(self):
+        if self.state != self.CAPTURE or not self.views:
+            return "Capture at least one view first."
+        self._begin_build()
+        return None
+
+    def update(self, frame, hands, now):
+        if self.state not in (self.BG, self.CAPTURE):
+            return
+        dt = 0.033 if self.t_prev is None else min(now - self.t_prev, 0.2)
+        self.t_prev, self.frame = now, frame
+        pts = hands[0][1] if hands else None
+        if self.state == self.BG:
+            if pts is not None:
+                self.bg_acc, self.bg_n = None, 0
+                self.msg = "Take your hand out of view..."
+                return
+            f = frame.astype(np.float32)
+            self.bg_acc = f if self.bg_acc is None else self.bg_acc + f
+            self.bg_n += 1
+            self.msg = f"Learning the background {self.bg_n}/{SCAN_BG_FRAMES}"
+            if self.bg_n >= SCAN_BG_FRAMES:
+                self.bg = (self.bg_acc / self.bg_n).astype(np.uint8)
+                self.state, self.msg = self.CAPTURE, "Hold the object in your hand inside the box"
+                self.say("Now hold the object in your hand, inside the box, and keep it still.")
+            return
+        self.mask = segment_object(frame, self.bg, pts) if pts is not None else None
+        area = int(np.count_nonzero(self.mask)) if self.mask is not None else 0
+        x0, y0, x1, y1 = self.roi
+        ok = pts is not None and area > 0.012 * (x1 - x0) * (y1 - y0)
+        palm = pts[9] if pts is not None else None
+        if palm is not None and self.last_palm is not None:
+            self.travel += float(np.linalg.norm(palm - self.last_palm))
+        self.last_palm = palm
+        if ok:
+            m = cv2.moments(self.mask, True)
+            c = (m["m10"] / max(m["m00"], 1e-6), m["m01"] / max(m["m00"], 1e-6))
+            steady = (self.last_c is not None and math.hypot(c[0] - self.last_c[0], c[1] - self.last_c[1]) < 8
+                      and abs(area - self.last_area) < 0.12 * max(self.last_area, 1))
+            self.last_c, self.last_area = c, area
+            self.stable = self.stable + dt if steady else 0.0
+        else:
+            self.stable, self.last_c = 0.0, None
+        armed = self.travel > SCAN_MIN_TRAVEL
+        n = len(self.views)
+        self.msg = (f"View {n + 1}/{SCAN_VIEWS}: " + ("hold it still" if armed else
+                    "turn the object 90 degrees to your left")) if ok else "Hold the object in your hand inside the box"
+        if ok and armed and self.stable >= SCAN_STABLE:
+            self._store()
+
+    def _store(self):
+        mask, frame = self.mask.copy(), self.frame.copy()
+        self.views.append((mask, frame))
+        ys, xs = np.nonzero(mask)
+        crop = cv2.bitwise_and(frame, frame, mask=mask)[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        k = 80.0 / max(crop.shape[:2])
+        th = cv2.resize(crop, (max(1, int(crop.shape[1] * k)), max(1, int(crop.shape[0] * k))))
+        canvas = np.zeros((80, 80, 3), np.uint8)
+        canvas[:th.shape[0], :th.shape[1]] = th
+        self.thumbs.append(canvas)
+        self.travel, self.stable = 0.0, 0.0
+        n = len(self.views)
+        if n >= SCAN_VIEWS:
+            self._begin_build()
+        else:
+            self.say(f"Captured view {n}. Turn the object ninety degrees to your left.")
+
+    def _begin_build(self):
+        self.state, self.msg = self.BUILD, "Building the 3D model..."
+        self.say("Building your model. This takes a few seconds.")
+        views = [(cv2.flip(m, 1), cv2.flip(f, 1)) for m, f in self.views]      # undo the mirror view
+
+        def work():
+            try:
+                mesh, colors = build_scan_model(views, SCAN_GRID, SCAN_TURN)
+                self.results.put(("ok", mesh, colors))
+            except Exception as exc:
+                self.results.put(("err", f"{type(exc).__name__}: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Online options: 3D models (Sketchfab) and explanations (Wikipedia)
+# ---------------------------------------------------------------------------
+def _http_get(url, headers=None, timeout=WEB_TIMEOUT):
+    req = urllib.request.Request(url, headers={"User-Agent": "SARA3D/1.0", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def search_sketchfab(query, n=MAX_OPTIONS):
+    url = "https://api.sketchfab.com/v3/search?" + urllib.parse.urlencode(
+        {"type": "models", "q": query, "count": n, "downloadable": "true"})
+    out = []
+    for m in json.loads(_http_get(url).decode("utf-8")).get("results", []):
+        thumbs = (m.get("thumbnails") or {}).get("images") or []
+        thumb = min(thumbs, key=lambda t: abs(t.get("width", 0) - 256))["url"] if thumbs else None
+        out.append({"source": "3D", "title": m.get("name", "3D model"), "uid": m.get("uid"),
+                    "sub": f"{(m.get('user') or {}).get('displayName', '')}  likes {m.get('likeCount', 0)}",
+                    "thumb": thumb, "url": m.get("viewerUrl") or f"https://sketchfab.com/models/{m.get('uid')}"})
+    return out
+
+
+def search_wikipedia(query, n=4):
+    params = {"action": "query", "generator": "search", "gsrsearch": query, "gsrlimit": n,
+              "prop": "pageimages|extracts", "piprop": "thumbnail", "pithumbsize": 300, "exintro": 1,
+              "explaintext": 1, "exsentences": 2, "format": "json", "formatversion": 2}
+    data = json.loads(_http_get("https://en.wikipedia.org/w/api.php?" + urllib.parse.urlencode(params)).decode("utf-8"))
+    pages = sorted(data.get("query", {}).get("pages", []), key=lambda p: p.get("index", 99))
+    return [{"source": "INFO", "title": p["title"], "sub": (p.get("extract") or "")[:120],
+             "text": p.get("extract") or p["title"], "thumb": (p.get("thumbnail") or {}).get("source"),
+             "url": "https://en.wikipedia.org/wiki/" + urllib.parse.quote(p["title"].replace(" ", "_"))}
+            for p in pages]
+
+
+def download_sketchfab(uid, token):
+    """Download a model (needs a free Sketchfab API token). Returns a .glb/.gltf path."""
+    info = json.loads(_http_get(f"https://api.sketchfab.com/v3/models/{uid}/download",
+                                {"Authorization": f"Token {token}"}).decode("utf-8"))
+    entry = info.get("glb") or info.get("gltf")
+    data = _http_get(entry["url"], timeout=90)
+    folder = os.path.join(tempfile.gettempdir(), "sara_downloads", uid)
+    os.makedirs(folder, exist_ok=True)
+    if info.get("glb"):
+        path = os.path.join(folder, "model.glb")
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+    zpath = os.path.join(folder, "model.zip")
+    with open(zpath, "wb") as fh:
+        fh.write(data)
+    with zipfile.ZipFile(zpath) as z:
+        z.extractall(folder)
+    for root, _, files in os.walk(folder):
+        for name in files:
+            if name.lower().endswith((".gltf", ".glb")):
+                return os.path.join(root, name)
+    raise RuntimeError("no glTF file in the download")
+
+
+class WebOptions:
+    """Shows online options on screen; 'select option N' loads it or reads it out."""
+
+    def __init__(self, cmd_queue, say):
+        self.cmd_queue, self.say = cmd_queue, say
+        self.results, self.query, self.status = [], "", ""
+        self.visible = self.busy = False
+
+    def search(self, query):
+        if self.busy:
+            return "I'm still searching."
+        self.query, self.status, self.visible, self.results = query, "SEARCHING...", True, []
+        threading.Thread(target=self._run, args=(query,), daemon=True).start()
+        return None
+
+    def _run(self, query):
+        self.busy = True
+        found, errors = [], []
+        for fn in (search_sketchfab, search_wikipedia):
+            try:
+                found += fn(query)
+            except Exception as exc:
+                errors.append(f"{fn.__name__.split('_')[1]}: {type(exc).__name__}")
+        self.results = found[:MAX_OPTIONS]
+        self.status = f"{len(self.results)} OPTIONS" + (f"  [{'; '.join(errors)}]" if errors else "")
+        if self.results:
+            self.say(f"I found {len(self.results)} options for {query}. Say select option one, "
+                     "or open option two to see it in your browser.")
+        else:
+            self.say(f"I couldn't find anything online for {query}. Check your internet connection.")
+        self.busy = False
+        for r in self.results:
+            try:
+                img = cv2.imdecode(np.frombuffer(_http_get(r["thumb"]), np.uint8), cv2.IMREAD_COLOR)
+                h, w = img.shape[:2]
+                k = max(96 / w, 72 / h)
+                img = cv2.resize(img, (int(w * k) + 1, int(h * k) + 1))
+                y0, x0 = (img.shape[0] - 72) // 2, (img.shape[1] - 96) // 2
+                r["img"] = img[y0:y0 + 72, x0:x0 + 96].copy()
+            except Exception:
+                pass
+
+    def pick(self, index, action=None):
+        if not self.results:
+            return "There are no options on screen. Say: show me options on something."
+        if not 1 <= index <= len(self.results):
+            return f"There is no option {index}."
+        r = self.results[index - 1]
+        can_load = r["source"] == "3D" and SKETCHFAB_TOKEN and r.get("uid")
+        if action == "open" or (r["source"] == "3D" and not can_load):
+            webbrowser.open(r["url"])
+            self.say(f"Opening {r['title']} in your browser."
+                     + (" Set a Sketchfab token to load models here." if r["source"] == "3D" and not can_load else ""))
+        elif can_load:
+            self.say(f"Downloading {r['title']}.")
+            threading.Thread(target=self._download, args=(r,), daemon=True).start()
+        else:
+            self.say(r.get("text") or r["title"])
+        return None
+
+    def _download(self, r):
+        try:
+            self.cmd_queue.put(Command("load_path", {"path": download_sketchfab(r["uid"], SKETCHFAB_TOKEN)}))
+        except Exception:
+            self.say("Sorry, the download failed.")
+
+
+# ---------------------------------------------------------------------------
+# HUD
+# ---------------------------------------------------------------------------
+class Backdrop:
+    def __init__(self, width, height):
+        ys, xs = np.mgrid[0:height, 0:width].astype(np.float32)
+        d = np.sqrt(((xs - width / 2) / (width / 2)) ** 2 + ((ys - height / 2) / (height / 2)) ** 2)
+        v = np.clip(1.15 - 0.55 * d, 0.35, 1.0)
+        self.vig = (v[..., None] * np.array([255, 232, 205], np.float32)).astype(np.uint8)
+
+    def apply(self, frame, t):
+        bg = cv2.multiply(frame, self.vig, scale=BG_BRIGHTNESS / 255.0)
+        y = int((t * 120) % H)
+        cv2.line(bg, (0, y), (W, y), (75, 58, 20), 1)
+        return bg
+
+
+def put(img, text, x, y, color=C_WHITE, scale=0.42, thick=1):
+    cv2.putText(img, text, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def panel(img, x0, y0, x1, y1, title=None, accent=C_CYAN):
+    img[y0:y1, x0:x1] = cv2.convertScaleAbs(img[y0:y1, x0:x1], alpha=0.30)
+    cv2.rectangle(img, (x0, y0), (x1, y1), C_EDGE, 1)
+    for cx, cy, dx, dy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
+        cv2.line(img, (cx, cy), (cx + dx * 14, cy), accent, 2, cv2.LINE_AA)
+        cv2.line(img, (cx, cy), (cx, cy + dy * 14), accent, 2, cv2.LINE_AA)
+    if title:
+        put(img, title, x0 + 12, y0 + 22, accent, 0.45)
+        cv2.line(img, (x0 + 10, y0 + 30), (x1 - 10, y0 + 30), C_EDGE, 1)
+
+
+def draw_hands(img, infos):
+    for h in infos:
+        pts = h["pts"]
+        for a, b in HAND_CONNECTIONS:
+            cv2.line(img, pts[a], pts[b], (130, 100, 35), 2, cv2.LINE_AA)
+        for i, p in enumerate(pts):
+            tip = i in (4, 8)
+            cv2.circle(img, p, 5 if tip else 3, C_GREEN if (tip and h["pinching"]) else C_CYAN, -1, cv2.LINE_AA)
+        if h["pinching"]:
+            cv2.line(img, pts[4], pts[8], C_GREEN, 3, cv2.LINE_AA)
+            pt = (int(h["point"][0]), int(h["point"][1]))
+            cv2.circle(img, pt, 18, C_GREEN, 2, cv2.LINE_AA)
+            cv2.circle(img, pt, 5, C_GREEN, -1, cv2.LINE_AA)
+        else:
+            cv2.line(img, pts[4], pts[8], (140, 110, 50), 1, cv2.LINE_AA)
+
+
+def dashed_line(img, p1, p2, color, dash=10):
+    length = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+    for i in range(0, int(length), dash * 2):
+        a, b = i / max(length, 1), min(i + dash, length) / max(length, 1)
+        cv2.line(img, (int(p1[0] + (p2[0] - p1[0]) * a), int(p1[1] + (p2[1] - p1[1]) * a)),
+                 (int(p1[0] + (p2[0] - p1[0]) * b), int(p1[1] + (p2[1] - p1[1]) * b)), color, 1, cv2.LINE_AA)
+
+
+def draw_object_overlays(img, studio):
+    sel = studio.sel
+    if sel is None:
+        return
+    r = int(sel.radius_px(studio.r))
+    cx, cy = int(sel.x), int(sel.y)
+    col = C_GREEN if sel.held else C_CYAN
+    ln = max(14, r // 4)
+    for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+        px, py = cx + sx * r, cy + sy * r
+        cv2.line(img, (px, py), (px - sx * ln, py), col, 2, cv2.LINE_AA)
+        cv2.line(img, (px, py), (px, py - sy * ln), col, 2, cv2.LINE_AA)
+    put(img, f"{sel.name}  {int(sel.scale * 100)}%  Z{sel.z:+.1f}  {sel.style.upper()}",
+        clamp(cx - r, 8, W - 330), max(20, cy - r - 10), col, 0.45)
+    e = sel.engine
+    if e:
+        bx, by = int(clamp(cx - r, 8, W - 330)), max(20, cy - r - 10) + 20
+        ecol = C_AMBER if e.on else C_DIM
+        put(img, f"ENGINE {'ON' if e.on else 'OFF'}   THRUST {int(round(e.thrust * 100))}%   RPM {int(e.rpm * 100)}%",
+            bx, by, ecol, 0.45)
+        cv2.rectangle(img, (bx, by + 6), (bx + 170, by + 14), C_EDGE, 1)
+        cv2.rectangle(img, (bx, by + 6), (bx + int(170 * e.thrust), by + 14), ecol, -1)
+    cand = studio.merge_candidate
+    if cand is not None:                                     # live merge preview while dragging
+        cr = int(cand.radius_px(studio.r))
+        cv2.circle(img, (int(cand.x), int(cand.y)), cr, C_AMBER, 2, cv2.LINE_AA)
+        dashed_line(img, (sel.x, sel.y), (cand.x, cand.y), C_AMBER)
+        put(img, "RELEASE TO SNAP + MERGE", (sel.x + cand.x) / 2 - 90, (sel.y + cand.y) / 2 - 12, C_AMBER, 0.5, 2)
+
+
+def draw_core(img, cx, cy, r, t, state):
+    col = {"idle": C_CYAN, "awake": C_AMBER, "speaking": C_GREEN, "offline": C_RED}[state]
+    pulse = 6 * math.sin(t * 10) if state == "speaking" else 2 * math.sin(t * 2)
+    cv2.ellipse(img, (cx, cy), (r + 16, r + 16), t * 60, 0, 250, col, 1, cv2.LINE_AA)
+    cv2.ellipse(img, (cx, cy), (r + 8, r + 8), -t * 90, 0, 200, C_BLUE, 1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), int(r * 0.55 + pulse), col, -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), int(r * 0.55 + pulse) + 4, C_WHITE, 1, cv2.LINE_AA)
+    put(img, "S.A.R.A", cx - 26, cy + r + 34, col, 0.45)
+
+
+HELP_LINES = [
+    ("VOICE  (say 'Sara' first)", C_AMBER),
+    ("scan this | capture | finish", C_WHITE),
+    ("show me options on jet engines", C_WHITE),
+    ("select option 2 | open option 2", C_WHITE),
+    ("add an engine | start the engine", C_WHITE),
+    ("thrust to 80 percent | engine off", C_WHITE),
+    ("add a cube | merge pyramid onto cube", C_WHITE),
+    ("align it | split | auto align on/off", C_WHITE),
+    ("on top of / inside / behind the cube", C_WHITE),
+    ("move it back | solid | blue | bigger", C_WHITE),
+    ("smooth it | original colours", C_WHITE),
+    ("list the parts | spin the blades", C_WHITE),
+    ("load a model | save", C_WHITE),
+    ("GESTURES", C_AMBER),
+    ("pinch = move  push/pull = depth", C_WHITE),
+    ("two hands = resize  empty = rotate", C_WHITE),
+    ("KEYS", C_AMBER),
+    ("K scan SPACE grab ENTER build G align", C_WHITE),
+    ("E engine  , . thrust  M merge  U split", C_WHITE),
+    ("1-6 add L load T type TAB next P part", C_WHITE),
+]
+
+
+def draw_scan_overlay(img, sc):
+    x0, y0, x1, y1 = sc.roi
+    col = C_GREEN if sc.state == Scanner.CAPTURE else C_AMBER
+    for px, py, dx, dy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
+        cv2.line(img, (px, py), (px + dx * 28, py), col, 3, cv2.LINE_AA)
+        cv2.line(img, (px, py), (px, py + dy * 28), col, 3, cv2.LINE_AA)
+    if sc.mask is not None and sc.mask.any():
+        cnts, _ = cv2.findContours(sc.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, cnts, -1, C_GREEN, 2, cv2.LINE_AA)
+    if sc.state == Scanner.CAPTURE and sc.stable > 0:
+        cv2.ellipse(img, ((x0 + x1) // 2, y0 - 12), (14, 14), -90, 0, 360 * clamp(sc.stable / SCAN_STABLE, 0, 1),
+                    C_GREEN, 3, cv2.LINE_AA)
+    put(img, f"3D SCAN  {sc.state}   VIEWS {len(sc.views)}/{SCAN_VIEWS}   (SPACE = capture, ENTER = build now)",
+        x0, y0 - 30, col, 0.5)
+    put(img, sc.msg, x0, y1 + 24, C_WHITE, 0.55, 1)
+    for i, th in enumerate(sc.thumbs):
+        xx, yy = x0 + 8 + i * 88, y1 - 90
+        img[yy:yy + 80, xx:xx + 80] = th
+        cv2.rectangle(img, (xx, yy), (xx + 80, yy + 80), C_GREEN, 1)
+
+
+def draw_web_panel(img, web):
+    if not web.visible:
+        return
+    x0, y0 = 296, 66
+    panel(img, x0 - 6, y0, x0 + MAX_OPTIONS * 112 + 2, y0 + 200,
+          f"ONLINE: {web.query[:26].upper()}   {web.status[:34]}", C_GREEN)
+    for i, r in enumerate(web.results[:MAX_OPTIONS]):
+        cx, cy = x0 + i * 112, y0 + 40
+        th = r.get("img")
+        if th is not None:
+            img[cy:cy + 72, cx:cx + 96] = th
+        else:
+            cv2.rectangle(img, (cx, cy), (cx + 96, cy + 72), C_EDGE, 1)
+        cv2.rectangle(img, (cx, cy), (cx + 96, cy + 72), C_GREEN if r["source"] == "3D" else C_AMBER, 1)
+        put(img, str(i + 1), cx + 4, cy + 22, C_WHITE, 0.8, 2)
+        put(img, "3D" if r["source"] == "3D" else "INFO", cx + 62, cy + 66, C_GREEN if r["source"] == "3D" else C_AMBER, 0.4)
+        title = r["title"]
+        put(img, title[:16], cx, cy + 92, C_WHITE, 0.38)
+        put(img, title[16:32], cx, cy + 106, C_WHITE, 0.38)
+        put(img, r.get("sub", "")[:17], cx, cy + 122, C_DIM, 0.34)
+        put(img, "say: option %d" % (i + 1), cx, cy + 140, C_CYAN, 0.34)
+
+
+def draw_map(img, studio, x0, y0, x1, y1):
+    """Top-down view of the 3D world: X across, depth (Z) up/down."""
+    panel(img, x0, y0, x1, y1, "3D MAP  (top view)", C_GREEN)
+    px0, py0, px1, py1 = x0 + 12, y0 + 42, x1 - 12, y1 - 12
+    xr, zr = 5.0, (Z_MIN, Z_MAX + 0.5)
+
+    def to_map(wx, wz):
+        return (int(px0 + (wx / xr + 1) / 2 * (px1 - px0)),
+                int(py0 + (zr[1] - wz) / (zr[1] - zr[0]) * (py1 - py0)))
+
+    cv2.rectangle(img, (px0, py0), (px1, py1), C_EDGE, 1)
+    for gz in range(int(Z_MIN), int(Z_MAX) + 1, 2):
+        cv2.line(img, to_map(-xr, gz), to_map(xr, gz), (60, 45, 20), 1)
+    for gx in range(-4, 5, 2):
+        cv2.line(img, to_map(gx, zr[0]), to_map(gx, zr[1]), (60, 45, 20), 1)
+    cam = to_map(0, Z_MAX + 0.4)
+    cv2.circle(img, cam, 4, C_WHITE, -1)
+    for o in studio.objects:
+        wx, _, wz = studio.r.unproject(o.x, o.y, o.z)
+        p = to_map(clamp(wx, -xr, xr), wz)
+        rad = int(clamp(o.scale * 9, 4, 22))
+        col = C_AMBER if o.selected else rgb_to_bgr(o.display_rgb())
+        cv2.circle(img, p, rad, col, -1 if o.selected else 2, cv2.LINE_AA)
+    put(img, "far", px0 + 4, py0 + 14, C_DIM, 0.36)
+    put(img, "you", cam[0] + 8, cam[1] - 4, C_DIM, 0.36)
+
+
+def draw_parts_panel(img, obj):
+    n = len(obj.parts)
+    if n <= 1:
+        return
+    rows = 8
+    start = 0 if obj.focus is None else int(clamp(obj.focus - rows // 2, 0, max(0, n - rows)))
+    vis = list(range(start, min(n, start + rows)))
+    y0 = 404
+    panel(img, W - 282, y0, W - 16, y0 + 30 + 20 * len(vis) + (18 if n > rows else 0) + 14, f"PARTS ({n})", C_AMBER)
+    for k, i in enumerate(vis):
+        p = obj.parts[i]
+        y = y0 + 52 + 20 * k
+        spin = "@" if (p.spinner and p.spinner.on) else " "
+        put(img, f"{'>' if obj.focus == i else ' '}{i + 1:>3} {p.name[:17]:<17} {spin}", W - 272, y,
+            C_AMBER if obj.focus == i else C_WHITE, 0.4)
+    if n > rows:
+        put(img, f"showing {vis[0] + 1}-{vis[-1] + 1} of {n}", W - 272, y0 + 52 + 20 * len(vis), C_DIM, 0.36)
+
+
+def draw_hud(img, studio, voice, fps, infos, t, typing):
+    panel(img, 16, 12, W - 16, 56)
+    put(img, "S.A.R.A 3D  //  SPATIAL AR STUDIO", 32, 42, C_CYAN, 0.65, 2)
+    put(img, f"AUTO-MERGE {'ON' if studio.auto_merge else 'OFF'}   AUTO-ALIGN {'ON' if studio.auto_align else 'OFF'}",
+        W - 700, 40, C_GREEN if studio.auto_merge else C_DIM, 0.5)
+    put(img, f"FPS {fps:4.0f}   OBJECTS {len(studio.objects)}", W - 300, 40, C_WHITE, 0.5)
+
+    panel(img, 16, 66, 282, 66 + 30 + 20 * len(HELP_LINES) + 10, "COMMAND DECK")
+    for i, (line, col) in enumerate(HELP_LINES):
+        put(img, line, 28, 66 + 52 + 20 * i, col, 0.36)
+    draw_map(img, studio, 16, 66 + 30 + 20 * len(HELP_LINES) + 20, 282, H - 88)
+
+    rows = studio.objects[:6]
+    panel(img, W - 282, 196, W - 16, 196 + 36 + 26 * max(len(rows), 1) + 14, "SCENE")
+    if not rows:
+        put(img, "empty - say 'Sara, add a cube'", W - 270, 246, C_DIM, 0.4)
+    for i, o in enumerate(rows):
+        y = 248 + 26 * i
+        cv2.rectangle(img, (W - 268, y - 11), (W - 254, y + 3), rgb_to_bgr(o.display_rgb()), -1)
+        put(img, ("> " if o.selected else "  ") + o.name[:16], W - 246, y + 2, C_CYAN if o.selected else C_WHITE, 0.42)
+        put(img, o.style.upper()[:4], W - 60, y + 2, C_DIM, 0.36)
+    if studio.sel:
+        draw_parts_panel(img, studio.sel)
+
+    state = "speaking" if voice.is_speaking else "awake" if voice.awake else "idle"
+    draw_core(img, W - 90, 116, 30, t, state)
+
+    panel(img, 16, H - 78, W - 16, H - 16)
+    if typing is not None:
+        put(img, "TYPE COMMAND >  " + typing + ("_" if int(t * 2) % 2 == 0 else " "), 32, H - 50, C_AMBER, 0.55)
+        put(img, "ENTER to run   ESC to cancel", 32, H - 26, C_DIM, 0.4)
+    else:
+        vs = "AWAKE - LISTENING FOR YOUR COMMAND" if voice.awake else ("SPEAKING" if voice.is_speaking else voice.status)
+        put(img, "MIC: " + vs, 32, H - 56, C_CYAN, 0.42)
+        put(img, "VOICE OUT: " + voice.speaker.label()[:70], 32, H - 38, C_GREEN if not voice.speaker.error else C_AMBER, 0.4)
+        put(img, ("HEARD: " + voice.heard[:52]) if voice.heard else "HEARD: -", 32, H - 22, C_DIM, 0.4)
+        put(img, ("SARA: " + voice.reply[:66]) if voice.reply else "SARA: -", 560, H - 22, C_WHITE, 0.42)
+        pinching = sum(1 for h in infos if h["pinching"])
+        gesture = {None: "IDLE", "move": "GRAB + MOVE", "rotate": "ROTATING", "resize": "TWO-HAND RESIZE"}[studio.mode]
+        put(img, f"HANDS {len(infos)}   PINCH {pinching}   {gesture}", 560, H - 46, C_GREEN if pinching else C_WHITE, 0.45)
+
+    now, y = time.time(), 92
+    for text, exp in studio.toasts:
+        if exp > now:
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            put(img, text, (W - tw) // 2, y, C_AMBER, 0.55)
+            y += 24
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+def main():
+    ensure_model()
+    renderer = Renderer(W, H, RENDER_SCALE)
+    studio = Studio(renderer)
+    cmd_q = queue.Queue()
+    voice = VoiceAssistant(cmd_q)
+    dialog_state = {}
+    studio.speak = voice.speak
+    studio.request_file_dialog = lambda: open_file_dialog(cmd_q, dialog_state)
+    scan_q = queue.Queue()
+    studio.scanner = Scanner(scan_q, voice.speak)
+    studio.web = WebOptions(cmd_q, voice.speak)
+    print(f"Voice output: {voice.speaker.mode}"
+          + ("" if HAS_EDGE else "   (for the human-like voice run: python -m pip install edge-tts)"))
+    print("Microphone:", "ready" if HAS_SR else "missing - python -m pip install SpeechRecognition pyaudio")
+
+    tracker = HandTracker()
+    tracker.start()
+    pinch, backdrop = PinchTracker(), Backdrop(W, H)
+
+    studio.add_shape("cube", "cyan")
+    studio.add_shape("pyramid", "amber")
+    studio.select(studio.objects[0])
+    voice.speak("Sara online. Say Sara, then tell me what to build.")
+
+    win = "S.A.R.A 3D Studio"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, W, H)
+
+    start = prev = time.time()
+    fps, last_id = 30.0, -1
+    typing, show_hud, fullscreen = None, True, False
+    shape_keys = {ord(str(i + 1)): s for i, s in enumerate(["cube", "pyramid", "cylinder", "sphere", "cone", "torus"])}
+
+    try:
+        while True:
+            fid, frame, hands = tracker.get(last_id)
+            if frame is not None and fid != last_id:
+                last_id = fid
+                now = time.time()
+                dt = clamp(now - prev, 0.001, 0.1)
+                prev = now
+                fps = 0.92 * fps + 0.08 / dt
+                t = now - start
+
+                studio.scanner.update(frame, hands, now)
+                while not scan_q.empty():
+                    res = scan_q.get_nowait()
+                    studio.scanner.state = Scanner.IDLE
+                    if res[0] == "ok":
+                        studio.add_scanned(res[1], res[2])
+                        studio.toast("SCAN COMPLETE", 4)
+                        voice.speak("Scan complete. You can paint it, smooth it, resize it, or merge it with other shapes.")
+                    else:
+                        studio.toast("SCAN FAILED: " + res[1][:60], 6)
+                        voice.speak("Sorry, the scan failed. Try again with better light.")
+                infos = pinch.update(hands)
+                studio.handle_gestures([(h["point"][0], h["point"][1], h["size"]) for h in infos if h["pinching"]])
+                while not cmd_q.empty():
+                    err = studio.execute(cmd_q.get_nowait())
+                    if err:
+                        voice.speak(err)
+                studio.update(dt)
+
+                out = composite(backdrop.apply(frame, t), renderer.render(studio.objects, t, studio.particles.gpu_array()), W, H)
+                if show_hud:
+                    draw_object_overlays(out, studio)
+                if studio.scanner.active():
+                    draw_scan_overlay(out, studio.scanner)
+                draw_hands(out, infos)
+                if show_hud:
+                    draw_hud(out, studio, voice, fps, infos, t, typing)
+                    draw_web_panel(out, studio.web)
+                cv2.imshow(win, out)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == 255:
+                continue
+            if typing is not None:
+                if key == 13:
+                    if typing.strip():
+                        voice.submit(typing, require_wake=False)
+                    typing = None
+                elif key == 27:
+                    typing = None
+                elif key in (8, 127):
+                    typing = typing[:-1]
+                elif 32 <= key < 127:
+                    typing += chr(key)
+                continue
+            if key in (27, ord("q")):
+                break
+            elif key == ord("t"):
+                typing = ""
+            elif key in (ord("l"), ord("o")):
+                studio.request_file_dialog()
+            elif key == 9:
+                studio.select_by("next")
+            elif key == ord("p") and studio.sel:
+                studio.select_part({"which": "next"})
+            elif key == ord("y"):
+                studio.toggle_focus_spin()
+            elif key in (ord("k"), 32, 13, ord("g"), ord("e"), ord(","), ord(".")):
+                sc = studio.scanner
+                if key == ord("k"):
+                    cmd = Command("scan_cancel" if sc.active() else "scan")
+                elif key == 32:
+                    cmd = Command("scan_capture")
+                elif key == 13:
+                    cmd = Command("scan_finish")
+                elif key == ord("g"):
+                    cmd = Command("align")
+                elif key == ord("e"):
+                    eng = studio.sel.engine if studio.sel else None
+                    cmd = Command("engine", {"on": not (eng and eng.on)})
+                else:
+                    cmd = Command("engine_thrust", {"pct": None, "delta": -0.1 if key == ord(",") else 0.1})
+                err = studio.execute(cmd)
+                if err:
+                    studio.toast(err.upper()[:70])
+            elif key == ord("m"):
+                err = studio.merge_selected()
+                studio.toast(err or "MERGED")
+            elif key == ord("u"):
+                err = studio.split_selected()
+                studio.toast(err or "SPLIT")
+            elif key == ord("a"):
+                studio.auto_merge = not studio.auto_merge
+                studio.toast("AUTO-MERGE " + ("ON" if studio.auto_merge else "OFF"))
+            elif key == ord("["):
+                studio.execute(Command("move", {"axis": "z", "amount": -0.5}))
+            elif key == ord("]"):
+                studio.execute(Command("move", {"axis": "z", "amount": 0.5}))
+            elif key == ord("x"):
+                studio.delete_selected()
+            elif key == ord("c"):
+                studio.cycle_color()
+            elif key == ord("v"):
+                studio.cycle_style()
+            elif key == ord("d"):
+                studio.duplicate()
+            elif key == ord("s"):
+                studio.export_selected()
+            elif key == ord("r"):
+                studio.execute(Command("reset"))
+            elif key in (ord("+"), ord("=")):
+                studio.execute(Command("scale", {"factor": 1.15}))
+            elif key == ord("-"):
+                studio.execute(Command("scale", {"factor": 0.87}))
+            elif key == ord("h"):
+                show_hud = not show_hud
+            elif key == ord("f"):
+                fullscreen = not fullscreen
+                cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN,
+                                      cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+            elif key in shape_keys:
+                studio.add_shape(shape_keys[key])
+    finally:
+        tracker.stop()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
